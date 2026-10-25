@@ -1,4 +1,4 @@
-
+## cwmera
 ![image](./images/ex.jpg)
 
 ## HARDWARE COMPONENTS
@@ -66,33 +66,43 @@
 | **D6** | Data Bit 6 | **GPIO 21** |
 | **D7** | Data Bit 7 | **GPIO 47** |
 
-### Comandi Pulsante:
-* **In Modalità Fotocamera (Mirino Live):**
-  * **1 Click Singolo:** Scatta la foto e la salva in locale su flash (`/DCIM/FOTO_xxxx.bmp`).
-  * **2 Click Rapidi (Doppio Click):** Apre la **gwlleria** mostrando l'ultima foto scattata.
-  * **Pressione Prolungata (Long Press > 380ms):**
-    * Appare a schermo il timer circolare di **`trasmissione?`** (`0% -> 100%`).
-    * Se alzi il dito prima del 100%: annullamento sicuro (`lascia per wnnullare`).
-    * Se completi il 100%: attiva la modalità **`cwmera wifi`** per trasmettere le foto al telefono!
-* **In Modalità Galleria (gwlleria):**
-  * **1 Click Singolo:** Foto precedente.
-  * **2 Click Rapidi (Doppio Click):** Torna al mirino live della fotocamera.
-  * **Pressione Prolungata (Long Press > 380ms):**
-    * Appare a schermo il timer circolare di **`eliminare?`** (`0% -> 100%`).
-    * Se alzi il dito prima del 100%: la foto rimane al sicuro.
-    * Se completi il 100%: la foto viene eliminata definitivamente (`eliminata!`).
+#### Pulsanti di Controllo -> ESP32-S3
+
+| Pulsante | Posizione / Funzione | Pin ESP32-S3 | Collegamento Elettrico |
+| --- | --- | --- | --- |
+| **Pulsante Camera** | In alto (Scatto / Mirino / Wi-Fi) | **GPIO 38** | Tra GPIO 38 e **GND** (pull-up interno abilitato) |
+| **Pulsante Galleria** | Accanto al display (Galleria / Scorri / Elimina) | **GPIO 39** | Tra GPIO 39 e **GND** (pull-up interno abilitato) |
+
+### Comandi Pulsanti:
+* **Pulsante in Alto (Fotocamera):**
+  * **Nel Mirino Live:**
+    * **Click Singolo:** Scatta istantaneamente la foto e la salva nella memoria flash (`/DCIM/FOTO_xxxx.jpg`).
+    * **Pressione Prolungata (> 450ms):** Appare a schermo il timer circolare di **`trasmissione`** (`0% -> 100%`). Se completato al 100%, avvia la modalità **`cwmera wifi`** per scaricare le foto sullo smartphone. Se rilasciato prima, torna al mirino live senza attivare il Wi-Fi.
+  * **In Modalità Galleria:**
+    * **Click Singolo o Tenuto Premuto:** Al rilascio torna al mirino live della fotocamera, senza ascoltare la trattenuta (nessuna attivazione involontaria del Wi-Fi).
+
+* **Pulsante Accanto al Display (Galleria):**
+  * **Nel Mirino Live:**
+    * **Click Singolo o Tenuto Premuto:** Al rilascio apre la **galleria** mostrando l'ultima foto scattata, senza ascoltare la trattenuta.
+  * **In Modalità Galleria:**
+    * **Click Singolo:** Scorre alla foto precedente.
+    * **Pressione Prolungata (> 450ms):** Appare a schermo il timer circolare di **`eliminazione`** (`0% -> 100%`). Se completato al 100%, la foto corrente viene cancellata definitivamente. Se rilasciato prima, l'eliminazione viene annullata in sicurezza.
+
 * **In Modalità Wi-Fi (cwmera wifi):**
-  * **1 Click Singolo:** Disattiva il Wi-Fi e torna al mirino live della fotocamera.
+  * **Click su qualsiasi pulsante:** Spegne il server Wi-Fi e torna al mirino live della fotocamera.
 
 ---
 
-### Come Collegare l'iPhone alla Fotocamera (Galleria Wi-Fi):
-1. Nel mirino della fotocamera, **tieni premuto il pulsante** fino al 100% del cerchio.
-2. Sullo schermo apparirà la schermata **`cwmera wifi`**.
-3. Sull'iPhone:
+### Come Collegare lo Smartphone alla Fotocamera (Galleria Wi-Fi per iOS e Android):
+1. Nel mirino della fotocamera, **tieni premuto il pulsante in alto** fino al completamento dell'anello per passare subito alla modalità **`cwmera wifi`**.
+2. Sullo smartphone (iPhone o Android):
    * Vai nelle impostazioni **Wi-Fi** e connettiti alla rete **`cwmera`** (nessuna password richiesta).
-   * Apri **Safari** e vai all'indirizzo **`192.168.4.1`** (spesso si apre automaticamente la schermata di benvenuto).
-   * Vedrai la galleria con tutte le foto scattate:
-     * Clicca **`salva`** per scaricare e salvare la foto direttamente nel rullino dell'iPhone!
-     * Clicca **`elimina`** per cancellare la foto dalla memoria dell'ESP32.
-4. Premi 1 volta il pulsante fisico sulla fotocamera per spegnere il Wi-Fi e riprendere a scattare!
+   * Se si apre la schermata automatica di accesso:
+     * Clicca su **`copia`** per copiare l'indirizzo (`http://192.168.4.1/`).
+     * Chiudi la schermata (su iPhone tocca **"Fine"** e seleziona **"Usa senza Internet"**; su Android mantieni la connessione Wi-Fi).
+   * Apri il tuo browser preferito (Safari, Chrome, Firefox...) e **incolla l'indirizzo** `http://192.168.4.1/`.
+   * Vedrai la galleria completa con:
+     * Memoria libera disponibile e stima delle foto rimanenti.
+     * Icona di download diretto per salvare le foto nel rullino.
+     * Icona cestino per eliminare le foto dall'ESP32.
+3. Premi 1 volta uno dei pulsanti fisici sulla fotocamera per spegnere il Wi-Fi e tornare istantaneamente al mirino live!

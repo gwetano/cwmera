@@ -38,9 +38,10 @@ Adafruit_ST7789 tft = Adafruit_ST7789(&SPI, TFT_CS, TFT_DC, TFT_RST);
 
 const int dataPins[8] = {1, 2, 3, 7, 13, 14, 21, 47};
 
-// --- PULSANTE MULTIFUNZIONE ---
-#define BUTTON_PIN      38
-#define BACKUP_BOOT_PIN 0
+// --- PULSANTI DI CONTROLLO ---
+#define BTN_CAMERA_PIN   38  // Pulsante in alto: Mirino / Scatto / Wi-Fi
+#define BTN_GALLERY_PIN  39  // Pulsante display: Galleria / Scorri / Elimina
+#define BACKUP_BOOT_PIN  0   // Tasto BOOT su scheda ESP32 (backup pulsante fotocamera)
 
 // ==============================================================================
 // STATI APPLICAZIONE E SERVER WI-FI
@@ -81,6 +82,22 @@ static inline byte readFIFOByteFast() {
   if (r0 & (1UL << 21)) b |= (1 << 6);
   if (r1 & (1UL << (47 - 32))) b |= (1 << 7);
   return b;
+}
+
+// ==============================================================================
+// FILTRO BIANCO E NERO (SATURAZIONE 0)
+// ==============================================================================
+#define BLACK_AND_WHITE 1
+
+static inline uint16_t rgb565ToGrayscale(uint16_t color) {
+  uint32_t r = (color >> 11) & 0x1F;
+  uint32_t g = (color >> 5) & 0x3F;
+  uint32_t b = color & 0x1F;
+  // Conversione standard Rec.601: 0.299 R + 0.587 G + 0.114 B
+  uint32_t y = (r * 77 + g * 75 + b * 29) >> 8;
+  if (y > 31) y = 31;
+  uint32_t g6 = (y << 1) | (y >> 4);
+  return (uint16_t)((y << 11) | (g6 << 5) | y);
 }
 
 void writeRegister(byte reg, byte val) {
@@ -211,6 +228,9 @@ bool captureAndSaveBMP(const String &path) {
       __asm__("nop; nop;");
 
       uint16_t color = (b1 << 8) | b2;
+#if BLACK_AND_WHITE
+      color = rgb565ToGrayscale(color);
+#endif
 
       uint8_t r = ((color >> 11) & 0x1F) << 3;
       uint8_t g = ((color >> 5) & 0x3F) << 2;
@@ -227,7 +247,7 @@ bool captureAndSaveBMP(const String &path) {
   return true;
 }
 
-bool displayBMP(const String &path) {
+bool displayBMP(const String &path, int startY = 0, int endY = 240) {
   File f = LittleFS.open(path, FILE_READ);
   if (!f) return false;
 
@@ -237,14 +257,26 @@ bool displayBMP(const String &path) {
     return false;
   }
 
+  if (startY < 0) startY = 0;
+  if (endY > 240) endY = 240;
+  if (startY >= endY) {
+    f.close();
+    return false;
+  }
+
+  if (startY > 0) {
+    f.seek(54 + (size_t)startY * 320 * 3);
+  }
+
+  int drawHeight = endY - startY;
   tft.startWrite();
-  tft.setAddrWindow(0, 0, 320, 240);
+  tft.setAddrWindow(0, startY, 320, drawHeight);
 
   uint8_t rowBytes[320 * 3];
   uint16_t rowPixels[320];
 
-  for (int y = 0; y < 240; y++) {
-    f.read(rowBytes, 320 * 3);
+  for (int y = startY; y < endY; y++) {
+    if (f.read(rowBytes, 320 * 3) != 320 * 3) break;
     for (int x = 0; x < 320; x++) {
       uint8_t b = rowBytes[x * 3 + 0];
       uint8_t g = rowBytes[x * 3 + 1];
@@ -292,10 +324,31 @@ bool captureAndSaveJPEG(const String &path) {
       STR_HIGH();
       __asm__("nop; nop;");
 
+#if BLACK_AND_WHITE
+      uint16_t c = rgb565ToGrayscale((b1 << 8) | b2);
+      frameBuf[idx++] = (uint8_t)(c >> 8);
+      frameBuf[idx++] = (uint8_t)(c & 0xFF);
+#else
       frameBuf[idx++] = b1;
       frameBuf[idx++] = b2;
+#endif
     }
   }
+
+  // Visualizza immediatamente il fermo immagine sul display (freeze frame)
+  tft.startWrite();
+  tft.setAddrWindow(0, 0, 320, 240);
+  uint16_t rowPixels[320];
+  for (int y = 0; y < 240; y++) {
+    int rowOffset = y * 320 * 2;
+    for (int x = 0; x < 320; x++) {
+      byte b1 = frameBuf[rowOffset + x * 2];
+      byte b2 = frameBuf[rowOffset + x * 2 + 1];
+      rowPixels[x] = (b1 << 8) | b2;
+    }
+    tft.writePixels(rowPixels, 320);
+  }
+  tft.endWrite();
 
   uint8_t *jpg_buf = NULL;
   size_t jpg_len = 0;
@@ -321,7 +374,7 @@ bool captureAndSaveJPEG(const String &path) {
   return (written == jpg_len);
 }
 
-bool displayJPEG(const String &path) {
+bool displayJPEG(const String &path, int startY = 0, int endY = 240) {
   File f = LittleFS.open(path, FILE_READ);
   if (!f) return false;
   size_t jpgSize = f.size();
@@ -349,11 +402,20 @@ bool displayJPEG(const String &path) {
     return false;
   }
 
+  if (startY < 0) startY = 0;
+  if (endY > 240) endY = 240;
+  if (startY >= endY) {
+    free(rgbBuf);
+    return false;
+  }
+
+  int drawHeight = endY - startY;
+
   tft.startWrite();
-  tft.setAddrWindow(0, 0, 320, 240);
+  tft.setAddrWindow(0, startY, 320, drawHeight);
   uint16_t rowPixels[320];
 
-  for (int y = 0; y < 240; y++) {
+  for (int y = startY; y < endY; y++) {
     int rowOffset = y * 320 * 3;
     for (int x = 0; x < 320; x++) {
       int px = rowOffset + x * 3;
@@ -370,11 +432,11 @@ bool displayJPEG(const String &path) {
   return true;
 }
 
-bool displayPhoto(const String &path) {
+bool displayPhoto(const String &path, int startY = 0, int endY = 240) {
   if (path.endsWith(".jpg") || path.endsWith(".jpeg")) {
-    return displayJPEG(path);
+    return displayJPEG(path, startY, endY);
   }
-  return displayBMP(path);
+  return displayBMP(path, startY, endY);
 }
 
 void drawArcSegment(int cx, int cy, int r1, int r2, float startDeg, float endDeg, uint16_t color) {
@@ -409,26 +471,65 @@ bool isCaptivePortalRequest() {
 void handleCaptivePortal() {
   String html = "<!DOCTYPE html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>cwmera</title>";
   html += "<style>*{box-sizing:border-box;margin:0;padding:0;border-radius:0!important;}";
-  html += "body{font-family:-apple-system,sans-serif;background:#fff;color:#000;padding:20px;text-align:left;}";
-  html += "h1{font-size:26px;font-weight:800;margin-bottom:6px;}";
+  html += "body{font-family:-apple-system,system-ui,sans-serif;background:#fff;color:#000;padding:20px;text-align:left;}";
+  html += "h1{font-size:26px;font-weight:800;margin-bottom:4px;}";
   html += ".sub{font-size:13px;color:#666;margin-bottom:20px;}";
   html += ".box{border:1px solid #000;padding:16px;margin-bottom:20px;}";
-  html += ".step{font-size:14px;margin-bottom:12px;line-height:1.4;}";
-  html += ".btn{display:block;width:100%;background:#000;color:#fff;text-align:center;padding:14px;font-size:15px;font-weight:700;text-decoration:none;border:1px solid #000;}";
+  html += ".step{font-size:14px;margin-bottom:12px;line-height:1.5;}";
+  html += ".step:last-child{margin-bottom:0;}";
+  html += ".url-bar{display:flex;border:1px solid #000;margin-bottom:20px;}";
+  html += ".url-txt{flex:1;padding:12px;font-size:15px;font-weight:700;background:#f5f5f5;font-family:monospace;display:flex;align-items:center;}";
+  html += ".btn-copy{background:#000;color:#fff;border:none;padding:12px 18px;font-size:14px;font-weight:700;display:flex;align-items:center;gap:6px;cursor:pointer;}";
+  html += ".btn-copy svg{stroke:#fff;}";
   html += "</style></head><body>";
   html += "<h1>cwmera</h1>";
   html += "<div class='sub'>trasmissione foto</div>";
+
   html += "<div class='box'>";
-  html += "<div class='step'>1. tocca <strong>'Fine'</strong> in alto a destra e scegli <strong>'Usa senza Internet'</strong></div>";
-  html += "<div class='step'>2. apri <strong>Safari</strong> su <strong>192.168.4.1</strong> per scaricare le foto</div>";
+  html += "<div class='step'><strong>1. Copia l'indirizzo</strong> con il tasto sottostante.</div>";
+  html += "<div class='step'><strong>2. Chiudi questa schermata</strong>:<br>&bull; Su iPhone tocca <strong>'Fine'</strong> in alto e scegli <strong>'Usa senza Internet'</strong>.<br>&bull; Su Android mantieni la connessione Wi-Fi dalla notifica.</div>";
+  html += "<div class='step'><strong>3. Apri il browser</strong> (Safari, Chrome...) e <strong>incolla l'indirizzo</strong> per scaricare le foto nel rullino.</div>";
   html += "</div>";
-  html += "<a href='http://192.168.4.1/' class='btn'>apri in safari</a>";
-  html += "</body></html>";
+
+  html += "<div class='url-bar'>";
+  html += "<div class='url-txt' id='u-val'>http://192.168.4.1/</div>";
+  html += "<button class='btn-copy' id='b-cp' onclick='copyLink()'>";
+  html += "<svg width='16' height='16' viewBox='0 0 24 24' fill='none' stroke-width='2.2'><rect x='9' y='9' width='13' height='13' rx='2' ry='2'/><path d='M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1'/></svg>";
+  html += "<span id='b-txt'>copia</span>";
+  html += "</button>";
+  html += "</div>";
+
+  html += "<script>";
+  html += "function copyLink(){";
+  html += "const u='http://192.168.4.1/';";
+  html += "if(navigator.clipboard&&navigator.clipboard.writeText){";
+  html += "navigator.clipboard.writeText(u).then(done);";
+  html += "}else{";
+  html += "const t=document.createElement('textarea');t.value=u;document.body.appendChild(t);t.select();";
+  html += "try{document.execCommand('copy');done();}catch(e){}";
+  html += "document.body.removeChild(t);";
+  html += "}}";
+  html += "function done(){";
+  html += "const b=document.getElementById('b-cp');const s=document.getElementById('b-txt');";
+  html += "b.style.background='#222';s.innerText='copiato!';";
+  html += "setTimeout(()=>{s.innerText='copia';},2000);";
+  html += "}";
+  html += "</script></body></html>";
 
   server.send(200, "text/html", html);
 }
 
 void handleGalleryPage() {
+  size_t totalB = LittleFS.totalBytes();
+  size_t usedB = LittleFS.usedBytes();
+  size_t freeB = (totalB > usedB) ? (totalB - usedB) : 0;
+  const size_t AVG_PHOTO_SIZE = 28 * 1024;
+  int photosLeft = freeB / AVG_PHOTO_SIZE;
+
+  char memStr[16];
+  if (freeB >= 1024 * 1024) snprintf(memStr, sizeof(memStr), "%.1f MB", (float)freeB / (1024.0f * 1024.0f));
+  else snprintf(memStr, sizeof(memStr), "%d KB", (int)(freeB / 1024));
+
   String jsonList = "[";
   for (size_t i = 0; i < photoList.size(); i++) {
     if (i > 0) jsonList += ",";
@@ -444,6 +545,8 @@ void handleGalleryPage() {
   html += ".top-bar{display:flex;justify-content:space-between;align-items:flex-end;}";
   html += ".brand{font-size:24px;font-weight:800;letter-spacing:-0.5px;}";
   html += ".count{font-size:13px;color:#555;margin-top:4px;}";
+  html += ".storage{font-size:12px;color:#666;margin-top:3px;}";
+  html += ".storage strong{color:#000;}";
   html += ".v-switch{display:flex;gap:6px;}";
   html += ".v-btn{border:1px solid #000;background:#fff;color:#000;padding:6px 10px;font-size:12px;font-weight:700;cursor:pointer;}";
   html += ".v-btn.act{background:#000;color:#fff;}";
@@ -452,7 +555,7 @@ void handleGalleryPage() {
   html += ".card{border:1px solid #000;background:#fff;padding:6px;}";
   html += ".card img{width:100%;height:auto;display:block;margin-bottom:6px;cursor:pointer;border:1px solid #eee;}";
   html += ".actions{display:flex;gap:6px;}";
-  html += ".btn-dl{flex:4;display:flex;align-items:center;justify-content:center;gap:6px;background:#000;color:#fff;border:1px solid #000;padding:10px 4px;font-size:13px;font-weight:700;text-decoration:none;cursor:pointer;}";
+  html += ".btn-dl{flex:1;display:flex;align-items:center;justify-content:center;background:#000;color:#fff;border:1px solid #000;padding:10px 4px;cursor:pointer;}";
   html += ".btn-del{flex:1;display:flex;align-items:center;justify-content:center;background:#fff;color:#000;border:1px solid #999;padding:10px 4px;cursor:pointer;}";
   html += ".empty{padding:30px 0;font-size:15px;color:#333;border:1px solid #000;text-align:left;padding-left:14px;margin-top:20px;}";
   html += "#lb{display:none;position:fixed;inset:0;background:#fff;z-index:999;flex-direction:column;padding:12px;}";
@@ -470,7 +573,9 @@ void handleGalleryPage() {
 
   html += "<header>";
   html += "<div class='top-bar'>";
-  html += "<div><div class='brand'>cwmera</div><div class='count'>foto in memoria: <span id='c-val'></span></div></div>";
+  html += "<div><div class='brand'>cwmera</div>";
+  html += "<div class='count'>foto in memoria: <span id='c-val'></span></div>";
+  html += "<div class='storage'>memoria libera: <strong>" + String(memStr) + "</strong> (~" + String(photosLeft) + " foto)</div></div>";
   html += "<div class='v-switch'>";
   html += "<button id='btn-g' class='v-btn act' onclick='setView(\"grid\")'>matrice</button>";
   html += "<button id='btn-l' class='v-btn' onclick='setView(\"list\")'>elenco</button>";
@@ -490,8 +595,8 @@ void handleGalleryPage() {
   html += "<button class='lb-nav lb-next' onclick='nextLb()'>&#8250;</button>";
   html += "</div>";
   html += "<div class='lb-foot'>";
-  html += "<a id='lb-dl' class='btn-dl' href=''>";
-  html += "<svg width='20' height='20' viewBox='0 0 24 24' fill='none' stroke='#fff' stroke-width='2.5'><path d='M12 3v13M6 11l6 6 6-6M3 20h18'/></svg> salva</a>";
+  html += "<a id='lb-dl' class='btn-dl' href='' title='scarica'>";
+  html += "<svg width='20' height='20' viewBox='0 0 24 24' fill='none' stroke='#fff' stroke-width='2.5'><path d='M12 3v13M6 11l6 6 6-6M3 20h18'/></svg></a>";
   html += "<button id='lb-del' class='btn-del' title='elimina'>";
   html += "<svg width='16' height='16' viewBox='0 0 24 24' fill='none' stroke='#222' stroke-width='2'><path d='M3 6h18M8 6V4h8v2M19 6v14H5V6M10 11v6M14 11v6'/></svg></button>";
   html += "</div></div>";
@@ -508,8 +613,8 @@ void handleGalleryPage() {
   html += "const n=photos[i];";
   html += "h+='<div class=\"card\"><img src=\"/photo?id='+n+'\" onclick=\"openLb('+i+')\">';";
   html += "h+='<div class=\"actions\">';";
-  html += "h+='<a href=\"/download?id='+n+'\" class=\"btn-dl\">';";
-  html += "h+='<svg width=\"18\" height=\"18\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"#fff\" stroke-width=\"2.5\"><path d=\"M12 3v13M6 11l6 6 6-6M3 20h18\"/></svg> salva</a>';";
+  html += "h+='<a href=\"/download?id='+n+'\" class=\"btn-dl\" title=\"scarica\">';";
+  html += "h+='<svg width=\"18\" height=\"18\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"#fff\" stroke-width=\"2.5\"><path d=\"M12 3v13M6 11l6 6 6-6M3 20h18\"/></svg></a>';";
   html += "h+='<button onclick=\"delPhoto('+n+')\" class=\"btn-del\"><svg width=\"15\" height=\"15\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"#222\" stroke-width=\"2\"><path d=\"M3 6h18M8 6V4h8v2M19 6v14H5V6M10 11v6M14 11v6\"/></svg></button>';";
   html += "h+='</div></div>';";
   html += "}";
@@ -673,23 +778,108 @@ void showWiFiScreen() {
   tft.print("click per tornare a scattare");
 }
 
+void showLiveTransitionScreen() {
+  tft.fillScreen(ST77XX_WHITE);
+  tft.setTextColor(ST77XX_BLACK);
+  tft.setTextSize(2);
+  tft.setCursor(124, 112);
+  tft.print("cwmera");
+  delay(250);
+}
+
+// Barra superiore unificata per la galleria
+void drawGalleryTopBar(int index, int total) {
+  tft.fillRect(0, 0, 320, 23, ST77XX_BLACK);
+  tft.drawFastHLine(0, 23, 320, COLOR_DARKGREY);
+
+  // Sinistra: scritta "gwlleria" (size 2) + counter leggermente più piccolo (size 1)
+  tft.setTextColor(ST77XX_WHITE);
+  tft.setTextSize(2);
+  tft.setCursor(8, 4);
+  tft.print("gwlleria");
+
+  tft.setTextSize(1);
+  tft.setCursor(8 + (8 * 12) + 6, 9);
+  tft.printf("[%d/%d]", index, total);
+
+  // Destra: Stima foto rimanenti + spazio libero
+  size_t totalB = LittleFS.totalBytes();
+  size_t usedB = LittleFS.usedBytes();
+  size_t freeB = (totalB > usedB) ? (totalB - usedB) : 0;
+  const size_t AVG_PHOTO_SIZE = 28 * 1024; // Stima media ~28 KB per scatto JPEG QVGA
+  int photosLeft = freeB / AVG_PHOTO_SIZE;
+
+  char photoBuf[16];
+  snprintf(photoBuf, sizeof(photoBuf), "~%d foto", photosLeft);
+  int photoWidth = strlen(photoBuf) * 6;
+
+  char memBuf[16];
+  if (freeB >= 1024 * 1024) {
+    snprintf(memBuf, sizeof(memBuf), "%.1fMB", (float)freeB / (1024.0f * 1024.0f));
+  } else {
+    snprintf(memBuf, sizeof(memBuf), "%dKB", (int)(freeB / 1024));
+  }
+  int memWidth = strlen(memBuf) * 6;
+
+  uint16_t remColor = (photosLeft < 20) ? ST77XX_RED : ST77XX_WHITE;
+
+  // Riga 1: foto rimanenti (bianco, o rosso se sotto le 20)
+  tft.setTextSize(1);
+  tft.setTextColor(remColor);
+  tft.setCursor(320 - 8 - photoWidth, 3);
+  tft.print(photoBuf);
+
+  // Riga 2: spazio di memoria rimanente (grigio chiaro e compatto)
+  tft.setTextColor(COLOR_LIGHTGREY);
+  tft.setCursor(320 - 8 - memWidth, 13);
+  tft.print(memBuf);
+}
+
+// Aggiorna solo il contatore foto senza ridisegnare l'intera barra o causare sfarfallio
+void updateGalleryCounter(int index, int total) {
+  tft.fillRect(108, 4, 72, 16, ST77XX_BLACK);
+  tft.setTextColor(ST77XX_WHITE);
+  tft.setTextSize(1);
+  tft.setCursor(110, 9);
+  tft.printf("[%d/%d]", index, total);
+}
+
+// Barra inferiore con istruzioni chiare e gerarchia visiva calma
+void drawGalleryBottomBar() {
+  tft.fillRect(0, 222, 320, 18, ST77XX_BLACK);
+  tft.drawFastHLine(0, 222, 320, COLOR_DARKGREY);
+  tft.setTextSize(1);
+
+  tft.setCursor(12, 227);
+  tft.setTextColor(ST77XX_WHITE);
+  tft.print("1 click ");
+  tft.setTextColor(COLOR_LIGHTGREY);
+  tft.print("scorre foto   ");
+  tft.setTextColor(COLOR_DARKGREY);
+  tft.print("|   ");
+  tft.setTextColor(ST77XX_WHITE);
+  tft.print("tieni premuto ");
+  tft.setTextColor(COLOR_LIGHTGREY);
+  tft.print("elimina");
+}
+
 // ==============================================================================
 // LOGICA GALLERIA ED INTERFACCIA A SCHERMO (STILE ORIGINARIO FOTOCAMERA)
 // ==============================================================================
-void showGalleryPhoto(int index) {
+void showGalleryPhoto(int index, bool fullRefresh = true) {
   if (totalPhotos == 0 || photoList.empty()) {
     tft.fillScreen(ST77XX_BLACK);
-    tft.setTextColor(ST77XX_YELLOW);
+    drawGalleryTopBar(0, 0);
+
+    tft.setTextColor(ST77XX_WHITE);
     tft.setTextSize(2);
-    tft.setCursor(65, 90);
-    tft.print("gwlleria vuota");
+    tft.setCursor(88, 100);
+    tft.print("nessuna foto");
     
     tft.setTextSize(1);
-    tft.setTextColor(ST77XX_WHITE);
-    tft.setCursor(45, 130);
-    tft.print("non hai scattato foto");
-    tft.setCursor(35, 150);
-    tft.print("doppio click per tornare a scattare");
+    tft.setTextColor(COLOR_LIGHTGREY);
+    tft.setCursor(55, 135);
+    tft.print("premi tasto alto per scattare");
     return;
   }
 
@@ -698,23 +888,18 @@ void showGalleryPhoto(int index) {
 
   int fileNum = photoList[index - 1];
   String path = getPhotoPath(fileNum);
-  displayPhoto(path);
 
-  // Barra Superiore
-  tft.fillRect(0, 0, 320, 22, ST77XX_BLACK);
-  tft.drawFastHLine(0, 22, 320, COLOR_DARKGREY);
-  tft.setTextColor(ST77XX_CYAN);
-  tft.setTextSize(2);
-  tft.setCursor(8, 4);
-  tft.printf("gwlleria [%d/%d]", index, totalPhotos);
+  // Disegna solo la finestra centrale della foto tra le due barre (y da 24 a 221)
+  displayPhoto(path, 24, 222);
 
-  // Barra Inferiore con istruzioni
-  tft.fillRect(0, 218, 320, 22, ST77XX_BLACK);
-  tft.drawFastHLine(0, 218, 320, COLOR_DARKGREY);
-  tft.setTextColor(ST77XX_WHITE);
-  tft.setTextSize(1);
-  tft.setCursor(12, 225);
-  tft.print("doppio click per tornare a scattare\ntieni premuto per eliminare");
+  if (fullRefresh) {
+    // Al primo caricamento o dopo cancellazione: ridisegna le barre complete
+    drawGalleryTopBar(index, totalPhotos);
+    drawGalleryBottomBar();
+  } else {
+    // Durante lo scorrimento: aggiorna SOLTANTO il contatore foto!
+    updateGalleryCounter(index, totalPhotos);
+  }
 }
 
 void deleteCurrentPhoto(int index) {
@@ -738,56 +923,66 @@ void deleteCurrentPhoto(int index) {
   }
 }
 
-// Timer sferico di eliminazione su pressione prolungata in galleria (squadrato, senza bordo laterale, sfondo bianco, barra spessa)
+// Timer sferico di eliminazione su pressione prolungata in galleria (banner scuro stile galleria, accenti rossi)
 void handleCircularDeleteTimer() {
   if (totalPhotos == 0 || photoList.empty()) return;
 
-  const uint16_t COLOR_DARKRED = 0xB000;
+  // Banner compatto a sfondo nero con bordi darkgrey in stile galleria
+  tft.fillRect(0, 70, 320, 100, ST77XX_BLACK);
+  tft.drawFastHLine(0, 70, 320, COLOR_DARKGREY);
+  tft.drawFastHLine(0, 169, 320, COLOR_DARKGREY);
 
-  // Box squadrato a tutta larghezza (senza bordo laterale, solo linee orizzontali)
-  tft.fillRect(0, 40, 320, 160, ST77XX_WHITE);
-  tft.drawFastHLine(0, 40, 320, ST77XX_BLACK);
-  tft.drawFastHLine(0, 41, 320, ST77XX_BLACK);
-  tft.drawFastHLine(0, 198, 320, ST77XX_BLACK);
-  tft.drawFastHLine(0, 199, 320, ST77XX_BLACK);
-
-  // Titolo elimina in rosso scuro leggibile su sfondo bianco
-  tft.setTextColor(COLOR_DARKRED);
+  // Titolo di stato in rosso a forte contrasto
+  tft.setTextColor(ST77XX_RED);
   tft.setTextSize(2);
-  tft.setCursor(25, 55);
-  tft.print("elimina?");
+  tft.setCursor(20, 86);
+  tft.print("eliminazione");
 
-  // Sottotitolo posizionato sotto la scritta elimina
-  tft.setTextColor(ST77XX_BLACK);
+  // Istruzione attiva in bianco
+  tft.setTextColor(ST77XX_WHITE);
   tft.setTextSize(1);
-  tft.setCursor(25, 78);
+  tft.setCursor(20, 114);
+  tft.print("tieni premuto per confermare");
+
+  // Istruzione di sicurezza/annullamento in grigio chiaro
+  tft.setTextColor(COLOR_LIGHTGREY);
+  tft.setTextSize(1);
+  tft.setCursor(20, 132);
   tft.print("rilascia per annullare");
 
-  // Anello guida di sfondo sottile
-  drawArcSegment(160, 126, 20, 32, 0, 360, COLOR_LIGHTGREY);
+  // Anello circolare di caricamento compatto a destra
+  const int CX = 255;
+  const int CY = 120;
+  const int R1 = 18;
+  const int R2 = 27;
+
+  // Traccia guida di sfondo in grigio scuro
+  drawArcSegment(CX, CY, R1, R2, 0, 360, COLOR_DARKGREY);
 
   const unsigned long TIMER_DURATION_MS = 1600;
   unsigned long timerStart = millis();
   float lastAngle = 0.0f;
   bool completed = false;
 
-  while (digitalRead(BUTTON_PIN) == LOW || digitalRead(BACKUP_BOOT_PIN) == LOW) {
+  while (digitalRead(BTN_GALLERY_PIN) == LOW) {
     unsigned long elapsed = millis() - timerStart;
     float fraction = (float)elapsed / (float)TIMER_DURATION_MS;
     if (fraction > 1.0f) fraction = 1.0f;
 
     float currentAngle = fraction * 360.0f;
     if (currentAngle > lastAngle) {
-      // Barra circolare spessa (raggio 20-32) in rosso scuro leggibile
-      drawArcSegment(160, 126, 20, 32, lastAngle, currentAngle, COLOR_DARKRED);
+      // Barra circolare in rosso vivo a forte contrasto sullo sfondo nero
+      drawArcSegment(CX, CY, R1, R2, lastAngle, currentAngle, ST77XX_RED);
       lastAngle = currentAngle;
     }
 
-    tft.fillRect(145, 120, 32, 12, ST77XX_WHITE);
-    tft.setTextColor(ST77XX_BLACK);
+    tft.fillRect(CX - 15, CY - 4, 30, 9, ST77XX_BLACK);
+    tft.setTextColor(ST77XX_WHITE);
     tft.setTextSize(1);
-    tft.setCursor(148, 122);
-    tft.printf("%d%%", (int)(fraction * 100));
+    int pct = (int)(fraction * 100);
+    int pctX = (pct < 10) ? (CX - 7) : ((pct < 100) ? (CX - 10) : (CX - 14));
+    tft.setCursor(pctX, CY - 4);
+    tft.printf("%d%%", pct);
 
     if (fraction >= 1.0f) {
       completed = true;
@@ -797,27 +992,26 @@ void handleCircularDeleteTimer() {
   }
 
   if (completed) {
-    tft.fillRect(0, 40, 320, 160, ST77XX_WHITE);
-    tft.drawFastHLine(0, 40, 320, ST77XX_BLACK);
-    tft.drawFastHLine(0, 41, 320, ST77XX_BLACK);
-    tft.drawFastHLine(0, 198, 320, ST77XX_BLACK);
-    tft.drawFastHLine(0, 199, 320, ST77XX_BLACK);
-    tft.setTextColor(COLOR_DARKRED);
+    tft.fillRect(0, 70, 320, 100, ST77XX_BLACK);
+    tft.drawFastHLine(0, 70, 320, COLOR_DARKGREY);
+    tft.drawFastHLine(0, 169, 320, COLOR_DARKGREY);
+
+    tft.setTextColor(ST77XX_RED);
     tft.setTextSize(2);
-    tft.setCursor(25, 105);
+    tft.setCursor(20, 110);
     tft.print("eliminata!");
-    delay(800);
+    delay(400);
 
     deleteCurrentPhoto(currentGalleryIndex);
 
-    while (digitalRead(BUTTON_PIN) == LOW || digitalRead(BACKUP_BOOT_PIN) == LOW) delay(10);
-    delay(100);
+    while (digitalRead(BTN_GALLERY_PIN) == LOW) delay(10);
+    delay(50);
   } else {
     showGalleryPhoto(currentGalleryIndex);
   }
 }
 
-// Timer sferico trasmissione Wi-Fi: Bordi squadrati, sfondo bianco, testo nero, barra CIANO SPESSA
+// Timer sferico trasmissione Wi-Fi: Bordi squadrati, sfondo bianco, testo nero, barra NERA SPESSA
 void handleCircularWiFiTimer() {
   tft.fillRect(40, 40, 240, 160, ST77XX_WHITE);
   tft.drawRect(40, 40, 240, 160, ST77XX_BLACK);
@@ -840,15 +1034,15 @@ void handleCircularWiFiTimer() {
   float lastAngle = 0.0f;
   bool completed = false;
 
-  while (digitalRead(BUTTON_PIN) == LOW || digitalRead(BACKUP_BOOT_PIN) == LOW) {
+  while (digitalRead(BTN_CAMERA_PIN) == LOW || digitalRead(BACKUP_BOOT_PIN) == LOW) {
     unsigned long elapsed = millis() - timerStart;
     float fraction = (float)elapsed / (float)TIMER_DURATION_MS;
     if (fraction > 1.0f) fraction = 1.0f;
 
     float currentAngle = fraction * 360.0f;
     if (currentAngle > lastAngle) {
-      // Barra Ciano spessa (raggio da 20 a 32 = 13 pixel di spessore!)
-      drawArcSegment(160, 126, 20, 32, lastAngle, currentAngle, ST77XX_CYAN);
+      // Barra circolare nera spessa (raggio da 20 a 32)
+      drawArcSegment(160, 126, 20, 32, lastAngle, currentAngle, ST77XX_BLACK);
       lastAngle = currentAngle;
     }
 
@@ -866,17 +1060,8 @@ void handleCircularWiFiTimer() {
   }
 
   if (completed) {
-    tft.fillRect(40, 40, 240, 160, ST77XX_WHITE);
-    tft.drawRect(40, 40, 240, 160, ST77XX_BLACK);
-    tft.drawRect(41, 41, 238, 158, ST77XX_BLACK);
-    tft.setTextColor(ST77XX_BLACK);
-    tft.setTextSize(2);
-    tft.setCursor(55, 105);
-    tft.print("attivato!");
-    delay(800);
-
-    while (digitalRead(BUTTON_PIN) == LOW || digitalRead(BACKUP_BOOT_PIN) == LOW) delay(10);
-    delay(100);
+    while (digitalRead(BTN_CAMERA_PIN) == LOW || digitalRead(BACKUP_BOOT_PIN) == LOW) delay(10);
+    delay(50);
 
     currentMode = MODE_WIFI;
     startWiFi();
@@ -889,37 +1074,23 @@ void handleCircularWiFiTimer() {
 void takeAndSavePhoto() {
   Serial.println(">>> SCATTO FOTO IN CORSO... <<<");
 
+  // 1. Flash bianco otturatore (shutter blink)
+  tft.fillScreen(ST77XX_WHITE);
+  delay(40);
+
   int nextNum = photoList.empty() ? 1 : (photoList.back() + 1);
   String path = getPhotoPath(nextNum);
 
-  tft.drawRect(0, 0, 320, 240, ST77XX_WHITE);
-  tft.drawRect(1, 1, 318, 238, ST77XX_WHITE);
-
-  tft.fillRect(45, 95, 230, 50, ST77XX_BLACK);
-  tft.drawRect(45, 95, 230, 50, ST77XX_YELLOW);
-  tft.setTextColor(ST77XX_YELLOW);
-  tft.setTextSize(2);
-  tft.setCursor(65, 110);
-  tft.print("elwborando...");
-
+  // 2. Acquisizione hardware, visualizzazione fermo immagine e salvataggio JPEG
   bool ok = captureAndSaveJPEG(path);
 
   if (ok) {
     photoList.push_back(nextNum);
     totalPhotos = photoList.size();
-
-    tft.fillRect(45, 95, 230, 50, ST77XX_BLACK);
-    tft.drawRect(45, 95, 230, 50, ST77XX_GREEN);
-    tft.setTextColor(ST77XX_GREEN);
-    tft.setTextSize(2);
-    tft.setCursor(75, 105);
-    tft.print("FOTO SALVATA!");
-    tft.setTextSize(1);
-    tft.setTextColor(ST77XX_WHITE);
-    tft.setCursor(95, 128);
-    tft.printf("#%04d (%d Totali)", nextNum, totalPhotos);
-    delay(1000);
+    // Breve pausa a elaborazione terminata per apprezzare il fermo prima del ritorno al live feed
+    delay(200);
   } else {
+    // Segnalazione solo in caso di errore effettivo
     tft.fillRect(45, 95, 230, 50, ST77XX_BLACK);
     tft.drawRect(45, 95, 230, 50, ST77XX_RED);
     tft.setTextColor(ST77XX_RED);
@@ -944,7 +1115,8 @@ void setup() {
   pinMode(RRST_PIN, OUTPUT);
   pinMode(STR_PIN, OUTPUT);
 
-  pinMode(BUTTON_PIN, INPUT_PULLUP);
+  pinMode(BTN_CAMERA_PIN, INPUT_PULLUP);
+  pinMode(BTN_GALLERY_PIN, INPUT_PULLUP);
   pinMode(BACKUP_BOOT_PIN, INPUT_PULLUP);
 
   digitalWrite(WR_PIN, LOW); 
@@ -992,6 +1164,7 @@ void setup() {
     {0x3D, 0xC0}, // COM13: Gamma Curve
     {0x4F, 0x80}, {0x50, 0x80}, {0x51, 0x00}, // Matrice Colori (Saturazione)
     {0x52, 0x22}, {0x53, 0x5E}, {0x54, 0x80},
+    {0x55, 0x88}, // BRIGHT: Abbassa leggermente la luminosita' (-8 in sign-magnitude, ~6%)
     {0x42, 0x00}  // COM17: Spegne definitivamente il test pattern/monoscopio
   };
 
@@ -1015,7 +1188,8 @@ void setup() {
 // LOOP PRINCIPALE
 // ==============================================================================
 void loop() {
-  bool btnPressed = (digitalRead(BUTTON_PIN) == LOW || digitalRead(BACKUP_BOOT_PIN) == LOW);
+  bool btnCamera = (digitalRead(BTN_CAMERA_PIN) == LOW || digitalRead(BACKUP_BOOT_PIN) == LOW);
+  bool btnGallery = (digitalRead(BTN_GALLERY_PIN) == LOW);
 
   // --------------------------------------------------------------------------
   // MODALITA' TRASMISSIONE WI-FI
@@ -1024,18 +1198,13 @@ void loop() {
     dnsServer.processNextRequest();
     server.handleClient();
 
-    if (btnPressed) {
-      while (digitalRead(BUTTON_PIN) == LOW || digitalRead(BACKUP_BOOT_PIN) == LOW) delay(10);
+    if (btnCamera || btnGallery) {
+      while (digitalRead(BTN_CAMERA_PIN) == LOW || digitalRead(BACKUP_BOOT_PIN) == LOW || digitalRead(BTN_GALLERY_PIN) == LOW) delay(10);
       delay(100);
 
       stopWiFi();
       currentMode = MODE_CAMERA;
-      tft.fillScreen(ST77XX_BLACK);
-      tft.setTextColor(ST77XX_GREEN);
-      tft.setTextSize(2);
-      tft.setCursor(75, 110);
-      tft.print("cwmera");
-      delay(300);
+      showLiveTransitionScreen();
     }
     delay(2);
     return;
@@ -1045,11 +1214,26 @@ void loop() {
   // MODALITA' GALLERIA
   // --------------------------------------------------------------------------
   if (currentMode == MODE_GALLERY) {
-    if (btnPressed) {
+    // 1. Pulsante in alto (Camera):
+    // Se cliccato o tenuto premuto in galleria, torna al feed live SOLO al rilascio.
+    // Ignora la trattenuta (non va in modalità di trasmissione).
+    if (btnCamera) {
+      while (digitalRead(BTN_CAMERA_PIN) == LOW || digitalRead(BACKUP_BOOT_PIN) == LOW) delay(10);
+      delay(50); // debounce rilascio
+
+      currentMode = MODE_CAMERA;
+      showLiveTransitionScreen();
+      return;
+    }
+
+    // 2. Pulsante display (Galleria):
+    // Click singolo: scorre le immagini.
+    // Pressione prolungata (>= 450ms): avvia il timer di eliminazione.
+    if (btnGallery) {
       unsigned long pressStart = millis();
       bool isLongPress = false;
 
-      while (digitalRead(BUTTON_PIN) == LOW || digitalRead(BACKUP_BOOT_PIN) == LOW) {
+      while (digitalRead(BTN_GALLERY_PIN) == LOW) {
         if (millis() - pressStart >= 450) {
           isLongPress = true;
           break;
@@ -1060,34 +1244,13 @@ void loop() {
       if (isLongPress) {
         handleCircularDeleteTimer();
       } else {
-        unsigned long releaseTime = millis();
-        bool isDoubleClick = false;
-        while (millis() - releaseTime < 450) {
-          if (digitalRead(BUTTON_PIN) == LOW || digitalRead(BACKUP_BOOT_PIN) == LOW) {
-            isDoubleClick = true;
-            while (digitalRead(BUTTON_PIN) == LOW || digitalRead(BACKUP_BOOT_PIN) == LOW) delay(10);
-            delay(100);
-            break;
+        delay(50); // debounce rilascio
+        if (totalPhotos > 0) {
+          currentGalleryIndex--;
+          if (currentGalleryIndex < 1) {
+            currentGalleryIndex = totalPhotos;
           }
-          delay(10);
-        }
-
-        if (isDoubleClick) {
-          currentMode = MODE_CAMERA;
-          tft.fillScreen(ST77XX_BLACK);
-          tft.setTextColor(ST77XX_GREEN);
-          tft.setTextSize(2);
-          tft.setCursor(75, 110);
-          tft.print("cwmera");
-          delay(300);
-        } else {
-          if (totalPhotos > 0) {
-            currentGalleryIndex--;
-            if (currentGalleryIndex < 1) {
-              currentGalleryIndex = totalPhotos;
-            }
-            showGalleryPhoto(currentGalleryIndex);
-          }
+          showGalleryPhoto(currentGalleryIndex, false);
         }
       }
     }
@@ -1098,11 +1261,27 @@ void loop() {
   // --------------------------------------------------------------------------
   // MODALITA' FOTOCAMERA (MIRINO STREAMING LIVE)
   // --------------------------------------------------------------------------
-  if (btnPressed) {
+  // 1. Pulsante display (Galleria):
+  // Se cliccato o tenuto premuto nel feed live, apre la galleria SOLO al rilascio,
+  // ignorando qualsiasi trattenuta prolungata.
+  if (btnGallery) {
+    while (digitalRead(BTN_GALLERY_PIN) == LOW) delay(10);
+    delay(50); // debounce rilascio
+
+    currentMode = MODE_GALLERY;
+    currentGalleryIndex = totalPhotos;
+    showGalleryPhoto(currentGalleryIndex);
+    return;
+  }
+
+  // 2. Pulsante in alto (Camera):
+  // Click singolo: scatta subito la foto!
+  // Pressione prolungata (>= 450ms): avvia il timer di trasmissione Wi-Fi.
+  if (btnCamera) {
     unsigned long pressStart = millis();
     bool isLongPress = false;
 
-    while (digitalRead(BUTTON_PIN) == LOW || digitalRead(BACKUP_BOOT_PIN) == LOW) {
+    while (digitalRead(BTN_CAMERA_PIN) == LOW || digitalRead(BACKUP_BOOT_PIN) == LOW) {
       if (millis() - pressStart >= 450) {
         isLongPress = true;
         break;
@@ -1114,27 +1293,9 @@ void loop() {
       handleCircularWiFiTimer();
       return;
     } else {
-      unsigned long releaseTime = millis();
-      bool isDoubleClick = false;
-      while (millis() - releaseTime < 450) {
-        if (digitalRead(BUTTON_PIN) == LOW || digitalRead(BACKUP_BOOT_PIN) == LOW) {
-          isDoubleClick = true;
-          while (digitalRead(BUTTON_PIN) == LOW || digitalRead(BACKUP_BOOT_PIN) == LOW) delay(10);
-          delay(100);
-          break;
-        }
-        delay(10);
-      }
-
-      if (isDoubleClick) {
-        currentMode = MODE_GALLERY;
-        currentGalleryIndex = totalPhotos;
-        showGalleryPhoto(currentGalleryIndex);
-        return;
-      } else {
-        takeAndSavePhoto();
-        return;
-      }
+      delay(50); // debounce rilascio
+      takeAndSavePhoto();
+      return;
     }
   }
 
@@ -1166,7 +1327,11 @@ void loop() {
       STR_HIGH();
       __asm__("nop; nop;");
 
+#if BLACK_AND_WHITE
+      lineBuffer[x] = rgb565ToGrayscale((b1 << 8) | b2);
+#else
       lineBuffer[x] = (b1 << 8) | b2;
+#endif
     }
     tft.writePixels(lineBuffer, 320);
   }
