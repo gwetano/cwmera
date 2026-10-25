@@ -7,6 +7,7 @@
 #include <WiFi.h>
 #include <WebServer.h>
 #include <DNSServer.h>
+#include <Preferences.h>
 #include <vector>
 #include <algorithm>
 #include "esp_camera.h"
@@ -42,6 +43,9 @@ const int dataPins[8] = {1, 2, 3, 7, 13, 14, 21, 47};
 #define BTN_CAMERA_PIN   38  // Pulsante in alto: Mirino / Scatto / Wi-Fi
 #define BTN_GALLERY_PIN  39  // Pulsante display: Galleria / Scorri / Elimina
 #define BACKUP_BOOT_PIN  0   // Tasto BOOT su scheda ESP32 (backup pulsante fotocamera)
+
+// --- BUZZER PASSIVO (FEEDBACK SONORO) ---
+#define BUZZER_PIN       41  // Pin segnale (+) buzzer piezoelettrico passivo
 
 // ==============================================================================
 // STATI APPLICAZIONE E SERVER WI-FI
@@ -85,19 +89,43 @@ static inline byte readFIFOByteFast() {
 }
 
 // ==============================================================================
-// FILTRO BIANCO E NERO (SATURAZIONE 0)
+// FILTRO BIANCO E NERO (SATURAZIONE 0) CON HIGHLIGHT ROLL-OFF & DITHERING
 // ==============================================================================
 #define BLACK_AND_WHITE 1
 
-static inline uint16_t rgb565ToGrayscale(uint16_t color) {
+static inline uint16_t rgb565ToGrayscale(uint16_t color, int x, int y) {
   uint32_t r = (color >> 11) & 0x1F;
   uint32_t g = (color >> 5) & 0x3F;
   uint32_t b = color & 0x1F;
-  // Conversione standard Rec.601: 0.299 R + 0.587 G + 0.114 B
-  uint32_t y = (r * 77 + g * 75 + b * 29) >> 8;
-  if (y > 31) y = 31;
-  uint32_t g6 = (y << 1) | (y >> 4);
-  return (uint16_t)((y << 11) | (g6 << 5) | y);
+
+  // Espansione canali a 8 bit (0..255)
+  uint32_t r8 = (r << 3) | (r >> 2);
+  uint32_t g8 = (g << 2) | (g >> 4);
+  uint32_t b8 = (b << 3) | (b >> 2);
+
+  // Luminanza standard Rec.601 ad alta precisione
+  uint32_t luma = (r8 * 77 + g8 * 150 + b8 * 29) >> 8;
+
+  // Compressione morbida delle alte luci (Highlight Roll-off):
+  // Evita lo stacco netto a gradino e la saturazione brusca nelle zone molto illuminate
+  if (luma > 210) {
+    uint32_t over = luma - 210;
+    luma = 210 + (over * 45) / (over + 10);
+    if (luma > 255) luma = 255;
+  }
+
+  // Micro-dithering 2x2: dissolve la posterizzazione e i bordi puntinati in un gradiente continuo
+  int d = ((x ^ y) & 1) ? 2 : -2;
+  int luma_d = (int)luma + d;
+  if (luma_d < 0) luma_d = 0;
+  else if (luma_d > 255) luma_d = 255;
+
+  // Ricostruzione RGB565 a 64 livelli continui
+  uint32_t r5 = (uint32_t)luma_d >> 3;
+  uint32_t g6 = (uint32_t)luma_d >> 2;
+  uint32_t b5 = (uint32_t)luma_d >> 3;
+
+  return (uint16_t)((r5 << 11) | (g6 << 5) | b5);
 }
 
 void writeRegister(byte reg, byte val) {
@@ -105,6 +133,59 @@ void writeRegister(byte reg, byte val) {
   Wire.write(reg);
   Wire.write(val);
   Wire.endTransmission();
+}
+
+// ==============================================================================
+// GESTIONE AUDIO E EFFETTI SONORI (BUZZER PASSIVO)
+// ==============================================================================
+Preferences soundPrefs;
+bool soundEnabled = true;
+
+void initSoundSetting() {
+  soundPrefs.begin("cwmera", false);
+  soundEnabled = soundPrefs.getBool("sound", true);
+}
+
+void saveSoundSetting(bool enabled) {
+  soundPrefs.putBool("sound", enabled);
+}
+
+// Jingle avvio a 3 picchi stile Super Mario (Fungo verde 1-UP: C6 -> E6 -> C7)
+void soundBoot() {
+  if (!soundEnabled) return;
+  tone(BUZZER_PIN, 1047); // C6
+  delay(65);
+  noTone(BUZZER_PIN);
+  delay(15);
+  tone(BUZZER_PIN, 1319); // E6
+  delay(65);
+  noTone(BUZZER_PIN);
+  delay(15);
+  tone(BUZZER_PIN, 2093); // C7
+  delay(140);
+  noTone(BUZZER_PIN);
+}
+
+void soundShutter() {
+  if (!soundEnabled) return;
+  tone(BUZZER_PIN, 1600);
+  delay(18);
+  noTone(BUZZER_PIN);
+  delay(12);
+  tone(BUZZER_PIN, 2400);
+  delay(30);
+  noTone(BUZZER_PIN);
+}
+
+void soundWiFiStart() {
+  if (!soundEnabled) return;
+  tone(BUZZER_PIN, 2000);
+  delay(55);
+  noTone(BUZZER_PIN);
+  delay(40);
+  tone(BUZZER_PIN, 2800);
+  delay(75);
+  noTone(BUZZER_PIN);
 }
 
 // ==============================================================================
@@ -229,7 +310,7 @@ bool captureAndSaveBMP(const String &path) {
 
       uint16_t color = (b1 << 8) | b2;
 #if BLACK_AND_WHITE
-      color = rgb565ToGrayscale(color);
+      color = rgb565ToGrayscale(color, x, y);
 #endif
 
       uint8_t r = ((color >> 11) & 0x1F) << 3;
@@ -325,7 +406,7 @@ bool captureAndSaveJPEG(const String &path) {
       __asm__("nop; nop;");
 
 #if BLACK_AND_WHITE
-      uint16_t c = rgb565ToGrayscale((b1 << 8) | b2);
+      uint16_t c = rgb565ToGrayscale((b1 << 8) | b2, x, y);
       frameBuf[idx++] = (uint8_t)(c >> 8);
       frameBuf[idx++] = (uint8_t)(c & 0xFF);
 #else
@@ -1063,6 +1144,7 @@ void handleCircularWiFiTimer() {
     while (digitalRead(BTN_CAMERA_PIN) == LOW || digitalRead(BACKUP_BOOT_PIN) == LOW) delay(10);
     delay(50);
 
+    soundWiFiStart();
     currentMode = MODE_WIFI;
     startWiFi();
     showWiFiScreen();
@@ -1074,7 +1156,8 @@ void handleCircularWiFiTimer() {
 void takeAndSavePhoto() {
   Serial.println(">>> SCATTO FOTO IN CORSO... <<<");
 
-  // 1. Flash bianco otturatore (shutter blink)
+  // 1. Feedback sonoro dell'otturatore e flash bianco (shutter blink)
+  soundShutter();
   tft.fillScreen(ST77XX_WHITE);
   delay(40);
 
@@ -1102,6 +1185,48 @@ void takeAndSavePhoto() {
 }
 
 // ==============================================================================
+// FEEDBACK VISIVO SU SCHERMO (MUTE / UNMUTE) E CONTROLLO COMBINATO TASTI
+// ==============================================================================
+void showSoundFeedbackScreen(bool enabled) {
+  tft.fillScreen(ST77XX_WHITE);
+  tft.setTextColor(ST77XX_BLACK);
+  tft.setTextSize(2);
+
+  if (enabled) {
+    // "suoni attivati" (14 car * 12px = 168px) -> centrato X = (320 - 168)/2 = 76
+    tft.setCursor(76, 112);
+    tft.print("suoni attivati");
+  } else {
+    // "suoni disattivati" (17 car * 12px = 204px) -> centrato X = (320 - 204)/2 = 58
+    tft.setCursor(58, 112);
+    tft.print("suoni disattivati");
+  }
+
+  delay(1500);
+}
+
+void handleDualButtonToggle() {
+  while (digitalRead(BTN_CAMERA_PIN) == LOW || digitalRead(BACKUP_BOOT_PIN) == LOW || digitalRead(BTN_GALLERY_PIN) == LOW) {
+    delay(10);
+  }
+  delay(80); // Debounce rilascio
+
+  soundEnabled = !soundEnabled;
+  saveSoundSetting(soundEnabled);
+
+  showSoundFeedbackScreen(soundEnabled);
+
+  // Ripristina la visualizzazione precedente
+  if (currentMode == MODE_CAMERA) {
+    showLiveTransitionScreen();
+  } else if (currentMode == MODE_GALLERY) {
+    showGalleryPhoto(currentGalleryIndex, true);
+  } else if (currentMode == MODE_WIFI) {
+    showWiFiScreen();
+  }
+}
+
+// ==============================================================================
 // SETUP
 // ==============================================================================
 void setup() {
@@ -1118,6 +1243,10 @@ void setup() {
   pinMode(BTN_CAMERA_PIN, INPUT_PULLUP);
   pinMode(BTN_GALLERY_PIN, INPUT_PULLUP);
   pinMode(BACKUP_BOOT_PIN, INPUT_PULLUP);
+
+  pinMode(BUZZER_PIN, OUTPUT);
+  noTone(BUZZER_PIN);
+  initSoundSetting();
 
   digitalWrite(WR_PIN, LOW); 
   digitalWrite(WRST_PIN, HIGH);
@@ -1164,7 +1293,7 @@ void setup() {
     {0x3D, 0xC0}, // COM13: Gamma Curve
     {0x4F, 0x80}, {0x50, 0x80}, {0x51, 0x00}, // Matrice Colori (Saturazione)
     {0x52, 0x22}, {0x53, 0x5E}, {0x54, 0x80},
-    {0x55, 0x88}, // BRIGHT: Abbassa leggermente la luminosita' (-8 in sign-magnitude, ~6%)
+    {0x55, 0x00}, // BRIGHT: Luminosita' neutra (elimina il clipping sovraesposto dell'AEC)
     {0x42, 0x00}  // COM17: Spegne definitivamente il test pattern/monoscopio
   };
 
@@ -1181,7 +1310,9 @@ void setup() {
   tft.setTextSize(1);
   tft.setCursor(88, 135);
   tft.printf("foto in memoria: %d", totalPhotos);
-  delay(1200);
+
+  soundBoot();
+  delay(900);
 }
 
 // ==============================================================================
@@ -1191,6 +1322,12 @@ void loop() {
   bool btnCamera = (digitalRead(BTN_CAMERA_PIN) == LOW || digitalRead(BACKUP_BOOT_PIN) == LOW);
   bool btnGallery = (digitalRead(BTN_GALLERY_PIN) == LOW);
 
+  // Controllo Pressione Simultanea dei due pulsanti (Attiva/Disattiva tutti i suoni)
+  if (btnCamera && btnGallery) {
+    handleDualButtonToggle();
+    return;
+  }
+
   // --------------------------------------------------------------------------
   // MODALITA' TRASMISSIONE WI-FI
   // --------------------------------------------------------------------------
@@ -1199,6 +1336,10 @@ void loop() {
     server.handleClient();
 
     if (btnCamera || btnGallery) {
+      if ((digitalRead(BTN_CAMERA_PIN) == LOW || digitalRead(BACKUP_BOOT_PIN) == LOW) && digitalRead(BTN_GALLERY_PIN) == LOW) {
+        handleDualButtonToggle();
+        return;
+      }
       while (digitalRead(BTN_CAMERA_PIN) == LOW || digitalRead(BACKUP_BOOT_PIN) == LOW || digitalRead(BTN_GALLERY_PIN) == LOW) delay(10);
       delay(100);
 
@@ -1218,7 +1359,13 @@ void loop() {
     // Se cliccato o tenuto premuto in galleria, torna al feed live SOLO al rilascio.
     // Ignora la trattenuta (non va in modalità di trasmissione).
     if (btnCamera) {
-      while (digitalRead(BTN_CAMERA_PIN) == LOW || digitalRead(BACKUP_BOOT_PIN) == LOW) delay(10);
+      while (digitalRead(BTN_CAMERA_PIN) == LOW || digitalRead(BACKUP_BOOT_PIN) == LOW) {
+        if (digitalRead(BTN_GALLERY_PIN) == LOW) {
+          handleDualButtonToggle();
+          return;
+        }
+        delay(10);
+      }
       delay(50); // debounce rilascio
 
       currentMode = MODE_CAMERA;
@@ -1234,6 +1381,10 @@ void loop() {
       bool isLongPress = false;
 
       while (digitalRead(BTN_GALLERY_PIN) == LOW) {
+        if (digitalRead(BTN_CAMERA_PIN) == LOW || digitalRead(BACKUP_BOOT_PIN) == LOW) {
+          handleDualButtonToggle();
+          return;
+        }
         if (millis() - pressStart >= 450) {
           isLongPress = true;
           break;
@@ -1265,7 +1416,13 @@ void loop() {
   // Se cliccato o tenuto premuto nel feed live, apre la galleria SOLO al rilascio,
   // ignorando qualsiasi trattenuta prolungata.
   if (btnGallery) {
-    while (digitalRead(BTN_GALLERY_PIN) == LOW) delay(10);
+    while (digitalRead(BTN_GALLERY_PIN) == LOW) {
+      if (digitalRead(BTN_CAMERA_PIN) == LOW || digitalRead(BACKUP_BOOT_PIN) == LOW) {
+        handleDualButtonToggle();
+        return;
+      }
+      delay(10);
+    }
     delay(50); // debounce rilascio
 
     currentMode = MODE_GALLERY;
@@ -1282,6 +1439,10 @@ void loop() {
     bool isLongPress = false;
 
     while (digitalRead(BTN_CAMERA_PIN) == LOW || digitalRead(BACKUP_BOOT_PIN) == LOW) {
+      if (digitalRead(BTN_GALLERY_PIN) == LOW) {
+        handleDualButtonToggle();
+        return;
+      }
       if (millis() - pressStart >= 450) {
         isLongPress = true;
         break;
@@ -1328,7 +1489,7 @@ void loop() {
       __asm__("nop; nop;");
 
 #if BLACK_AND_WHITE
-      lineBuffer[x] = rgb565ToGrayscale((b1 << 8) | b2);
+      lineBuffer[x] = rgb565ToGrayscale((b1 << 8) | b2, x, y);
 #else
       lineBuffer[x] = (b1 << 8) | b2;
 #endif

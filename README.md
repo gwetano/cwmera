@@ -73,6 +73,13 @@
 | **Pulsante Camera** | In alto (Scatto / Mirino / Wi-Fi) | **GPIO 38** | Tra GPIO 38 e **GND** (pull-up interno abilitato) |
 | **Pulsante Galleria** | Accanto al display (Galleria / Scorri / Elimina) | **GPIO 39** | Tra GPIO 39 e **GND** (pull-up interno abilitato) |
 
+#### Buzzer Passivo (Feedback Sonoro) -> ESP32-S3
+
+| Componente | Pin Buzzer | Pin ESP32-S3 | Collegamento Elettrico |
+| --- | --- | --- | --- |
+| **Buzzer Passivo** | Positivo / Segnale (`+` o `S`) | **GPIO 41** | Collegato a GPIO 41 |
+| | Negativo / Terra (`-`) | **GND** | Collegato a GND |
+
 ### Comandi Pulsanti:
 * **Pulsante in Alto (Fotocamera):**
   * **Nel Mirino Live:**
@@ -90,6 +97,11 @@
 
 * **In Modalità Wi-Fi (cwmera wifi):**
   * **Click su qualsiasi pulsante:** Spegne il server Wi-Fi e torna al mirino live della fotocamera.
+
+* **Pressione Simultanea (Entrambi i Pulsanti Insieme):**
+  * **In qualsiasi modalità:** Disattiva o riattiva istantaneamente tutti i suoni di sistema (muta / smuta).
+  * L'impostazione viene **salvata in modo permanente** nella memoria non volatile (NVS).
+  * Mostra per 1.5 secondi una schermata bianca con la scritta centrata **"suoni attivati"** o **"suoni disattivati"** prima di tornare alla visualizzazione precedente.
 
 ---
 
