@@ -1161,7 +1161,7 @@ void performOnlineOTA(String ssid, String pass) {
   }
 
   if (downloadUrl.length() == 0) {
-    downloadUrl = "https://github.com/" GITHUB_REPO "/releases/download/" + latestTag + "/cwmera.bin";
+    downloadUrl = "https://github.com/" GITHUB_REPO "/releases/download/" + latestTag + "/FOTOCAMERA.ino.bin";
   }
 
   // 4. Download firmware e scrittura nella partizione OTA
