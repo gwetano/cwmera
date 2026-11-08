@@ -10,9 +10,19 @@
 #include <Preferences.h>
 #include <vector>
 #include <algorithm>
+#include <WiFiClientSecure.h>
+#include <HTTPClient.h>
+#include <HTTPUpdate.h>
+#include <Update.h>
 #include "esp_camera.h"
 #include "img_converters.h"
 #include "soc/gpio_reg.h"
+
+// ==============================================================================
+// VERSIONE FIRMWARE & AGGIORNAMENTI OTA (GITHUB RELEASES)
+// ==============================================================================
+#define CWMERA_VERSION "1.1.0"
+#define GITHUB_REPO    "gwetano/cwmera"
 
 // ==============================================================================
 // CONFIGURAZIONE PIN
@@ -65,6 +75,12 @@ std::vector<int> photoList;
 WebServer server(80);
 DNSServer dnsServer;
 
+// Stato richiesta OTA online da interfaccia Web
+bool otaRequested = false;
+unsigned long otaRequestedMillis = 0;
+String otaTargetSSID = "";
+String otaTargetPass = "";
+
 // ==============================================================================
 // ROUTINE FAST I/O PER FIFO OV7670
 // ==============================================================================
@@ -86,6 +102,44 @@ static inline byte readFIFOByteFast() {
   if (r0 & (1UL << 21)) b |= (1 << 6);
   if (r1 & (1UL << (47 - 32))) b |= (1 << 7);
   return b;
+}
+
+// Sincronizzazione VSYNC pulita con rilevamento fronte ed eliminazione disallineamento byte
+static inline void captureFrameToFIFO() {
+  // 1. Se VSYNC e' gia' HIGH (meta' intervallo blanking), attendi prima che torni LOW
+  while (digitalRead(VSY_PIN) == HIGH);
+
+  // 2. Attendi il fronte di salita (inizio pulito dell'intervallo di blanking verticale del nuovo frame)
+  while (digitalRead(VSY_PIN) == LOW);
+
+  // 3. Resetta il puntatore di SCRITTURA della FIFO (WRST)
+  digitalWrite(WRST_PIN, LOW);
+  delayMicroseconds(5);
+  digitalWrite(WRST_PIN, HIGH);
+
+  // 4. Attendi il fronte di discesa (inizio esatto della trasmissione attiva dei pixel)
+  while (digitalRead(VSY_PIN) == HIGH);
+
+  // 5. Abilita la scrittura nella FIFO
+  digitalWrite(WR_PIN, HIGH);
+
+  // 6. Attendi il completamento di tutte le 240 linee (VSYNC torna HIGH)
+  while (digitalRead(VSY_PIN) == LOW);
+
+  // 7. Blocca immediatamente la scrittura nella FIFO
+  digitalWrite(WR_PIN, LOW);
+}
+
+// Reset del puntatore di LETTURA della FIFO all'indirizzo 0x00000 (primo byte pixel 0)
+static inline void resetFIFOReadPointer() {
+  digitalWrite(RRST_PIN, LOW);
+  delayMicroseconds(5);
+  digitalWrite(STR_PIN, LOW);
+  delayMicroseconds(2);
+  digitalWrite(STR_PIN, HIGH);
+  delayMicroseconds(2);
+  digitalWrite(RRST_PIN, HIGH);
+  delayMicroseconds(5);
 }
 
 // ==============================================================================
@@ -128,11 +182,17 @@ static inline uint16_t rgb565ToGrayscale(uint16_t color, int x, int y) {
   return (uint16_t)((r5 << 11) | (g6 << 5) | b5);
 }
 
-void writeRegister(byte reg, byte val) {
-  Wire.beginTransmission(0x21);
-  Wire.write(reg);
-  Wire.write(val);
-  Wire.endTransmission();
+bool writeRegister(byte reg, byte val) {
+  for (int attempt = 0; attempt < 5; attempt++) {
+    Wire.beginTransmission(0x21);
+    Wire.write(reg);
+    Wire.write(val);
+    if (Wire.endTransmission() == 0) {
+      return true;
+    }
+    delay(3);
+  }
+  return false;
 }
 
 // ==============================================================================
@@ -185,6 +245,17 @@ void soundWiFiStart() {
   delay(40);
   tone(BUZZER_PIN, 2800);
   delay(75);
+  noTone(BUZZER_PIN);
+}
+
+void soundError() {
+  if (!soundEnabled) return;
+  tone(BUZZER_PIN, 440);
+  delay(120);
+  noTone(BUZZER_PIN);
+  delay(50);
+  tone(BUZZER_PIN, 330);
+  delay(160);
   noTone(BUZZER_PIN);
 }
 
@@ -278,15 +349,8 @@ void writeBMPHeader(File &f, int32_t width, int32_t height) {
 }
 
 bool captureAndSaveBMP(const String &path) {
-  while(digitalRead(VSY_PIN) == LOW);
-  digitalWrite(WRST_PIN, LOW); delayMicroseconds(5); digitalWrite(WRST_PIN, HIGH);
-  while(digitalRead(VSY_PIN) == HIGH); digitalWrite(WR_PIN, HIGH);
-  while(digitalRead(VSY_PIN) == LOW);  digitalWrite(WR_PIN, LOW);
-
-  digitalWrite(RRST_PIN, LOW); delayMicroseconds(5);
-  digitalWrite(STR_PIN, LOW); delayMicroseconds(2);
-  digitalWrite(STR_PIN, HIGH); delayMicroseconds(2);
-  digitalWrite(RRST_PIN, HIGH); delayMicroseconds(5);
+  captureFrameToFIFO();
+  resetFIFOReadPointer();
 
   File f = LittleFS.open(path, FILE_WRITE);
   if (!f) return false;
@@ -372,15 +436,8 @@ bool displayBMP(const String &path, int startY = 0, int endY = 240) {
 }
 
 bool captureAndSaveJPEG(const String &path) {
-  while(digitalRead(VSY_PIN) == LOW);
-  digitalWrite(WRST_PIN, LOW); delayMicroseconds(5); digitalWrite(WRST_PIN, HIGH);
-  while(digitalRead(VSY_PIN) == HIGH); digitalWrite(WR_PIN, HIGH);
-  while(digitalRead(VSY_PIN) == LOW);  digitalWrite(WR_PIN, LOW);
-
-  digitalWrite(RRST_PIN, LOW); delayMicroseconds(5);
-  digitalWrite(STR_PIN, LOW); delayMicroseconds(2);
-  digitalWrite(STR_PIN, HIGH); delayMicroseconds(2);
-  digitalWrite(RRST_PIN, HIGH); delayMicroseconds(5);
+  captureFrameToFIFO();
+  resetFIFOReadPointer();
 
   size_t frameSize = 320 * 240 * sizeof(uint16_t);
   uint8_t *frameBuf = (uint8_t*)ps_malloc(frameSize);
@@ -638,6 +695,18 @@ void handleGalleryPage() {
   html += ".actions{display:flex;gap:6px;}";
   html += ".btn-dl{flex:1;display:flex;align-items:center;justify-content:center;background:#000;color:#fff;border:1px solid #000;padding:10px 4px;cursor:pointer;}";
   html += ".btn-del{flex:1;display:flex;align-items:center;justify-content:center;background:#fff;color:#000;border:1px solid #999;padding:10px 4px;cursor:pointer;}";
+  html += "#btn-ota{display:flex;align-items:center;justify-content:center;padding:6px 9px;}";
+  html += "#ota-m{display:none;position:fixed;inset:0;background:rgba(255,255,255,0.94);backdrop-filter:blur(3px);z-index:1000;padding:16px;align-items:center;justify-content:center;}";
+  html += "#ota-m.open{display:flex;}";
+  html += ".ota-box{background:#fff;border:2px solid #000;width:100%;max-width:320px;padding:18px;}";
+  html += ".ota-t{font-size:18px;font-weight:800;margin-bottom:4px;}";
+  html += ".ota-v{font-size:12px;color:#555;margin-bottom:16px;}";
+  html += ".ota-lbl{font-size:11px;font-weight:700;text-transform:uppercase;margin-bottom:4px;display:block;}";
+  html += ".ota-in{width:100%;border:1px solid #000;padding:8px 10px;font-size:14px;margin-bottom:10px;font-family:inherit;}";
+  html += ".ota-chk{display:flex;align-items:center;gap:6px;font-size:12px;margin-bottom:16px;cursor:pointer;}";
+  html += ".ota-actions{display:flex;gap:8px;}";
+  html += ".ota-btn{flex:1;border:1px solid #000;background:#000;color:#fff;padding:10px 6px;font-size:13px;font-weight:700;cursor:pointer;text-align:center;}";
+  html += ".ota-btn-sec{background:#fff;color:#000;}";
   html += ".empty{padding:30px 0;font-size:15px;color:#333;border:1px solid #000;text-align:left;padding-left:14px;margin-top:20px;}";
   html += "#lb{display:none;position:fixed;inset:0;background:#fff;z-index:999;flex-direction:column;padding:12px;}";
   html += "#lb.open{display:flex;}";
@@ -658,6 +727,9 @@ void handleGalleryPage() {
   html += "<div class='count'>foto in memoria: <span id='c-val'></span></div>";
   html += "<div class='storage'>memoria libera: <strong>" + String(memStr) + "</strong> (~" + String(photosLeft) + " foto)</div></div>";
   html += "<div class='v-switch'>";
+  html += "<button id='btn-ota' class='v-btn' onclick='openOta()' title='aggiorna firmware'>";
+  html += "<svg width='14' height='14' viewBox='0 0 24 24' fill='none' stroke='currentColor' stroke-width='2.2'><path d='M21 15v4H3v-4M7 10l5 5 5-5M12 15V3'/></svg>";
+  html += "</button>";
   html += "<button id='btn-g' class='v-btn act' onclick='setView(\"grid\")'>matrice</button>";
   html += "<button id='btn-l' class='v-btn' onclick='setView(\"list\")'>elenco</button>";
   html += "</div></div></header>";
@@ -681,6 +753,27 @@ void handleGalleryPage() {
   html += "<button id='lb-del' class='btn-del' title='elimina'>";
   html += "<svg width='16' height='16' viewBox='0 0 24 24' fill='none' stroke='#222' stroke-width='2'><path d='M3 6h18M8 6V4h8v2M19 6v14H5V6M10 11v6M14 11v6'/></svg></button>";
   html += "</div></div>";
+
+  // Modal Aggiornamento OTA Online
+  html += "<div id='ota-m'>";
+  html += "<div class='ota-box'>";
+  html += "<div id='ota-form'>";
+  html += "<div class='ota-t'>aggiornamento</div>";
+  html += "<div class='ota-v'>versione corrente: <strong>v" CWMERA_VERSION "</strong></div>";
+  html += "<label class='ota-lbl'>rete wi-fi (2.4 ghz)</label>";
+  html += "<input type='text' id='ota-ssid' class='ota-in' placeholder='nome rete (SSID)' autocapitalize='none' autocomplete='off'>";
+  html += "<label class='ota-lbl'>password</label>";
+  html += "<input type='password' id='ota-pass' class='ota-in' placeholder='password'>";
+  html += "<label class='ota-chk'><input type='checkbox' id='ota-save' checked> memorizza questa rete</label>";
+  html += "<div class='ota-actions'>";
+  html += "<button class='ota-btn ota-btn-sec' onclick='closeOta()'>annulla</button>";
+  html += "<button class='ota-btn' onclick='submitOta()'>verifica</button>";
+  html += "</div></div>";
+  html += "<div id='ota-wait' style='display:none;'>";
+  html += "<div class='ota-t'>avviato!</div>";
+  html += "<div style='font-size:13px;line-height:1.5;margin:12px 0 16px;'>cwmera si sta connettendo a <strong><span id='wait-ssid'></span></strong>.<br><br><strong>guarda lo schermo della fotocamera</strong> per seguire l'avanzamento su GitHub.</div>";
+  html += "<div class='ota-v' style='margin-bottom:0;'>puoi chiudere questa pagina.</div>";
+  html += "</div></div></div>";
 
   html += "<script>";
   html += "const photos=" + jsonList + ";";
@@ -728,6 +821,26 @@ void handleGalleryPage() {
   html += "const lb=document.getElementById('lb');if(!lb||lb.className!=='open')return;";
   html += "const diffX=e.changedTouches[0].screenX-touchStartX;";
   html += "if(diffX>50)prevLb();if(diffX<-50)nextLb();},false);";
+
+  html += "function openOta(){";
+  html += "fetch('/ota-info').then(r=>r.json()).then(d=>{";
+  html += "if(d.ssid)document.getElementById('ota-ssid').value=d.ssid;";
+  html += "if(d.pass)document.getElementById('ota-pass').value=d.pass;";
+  html += "document.getElementById('ota-m').className='open';";
+  html += "}).catch(()=>{document.getElementById('ota-m').className='open';});";
+  html += "}";
+  html += "function closeOta(){document.getElementById('ota-m').className='';}";
+  html += "function submitOta(){";
+  html += "const s=document.getElementById('ota-ssid').value.trim();";
+  html += "const p=document.getElementById('ota-pass').value;";
+  html += "const sv=document.getElementById('ota-save').checked?'1':'0';";
+  html += "if(!s){alert('inserisci il nome della rete');return;}";
+  html += "document.getElementById('wait-ssid').innerText=s;";
+  html += "document.getElementById('ota-form').style.display='none';";
+  html += "document.getElementById('ota-wait').style.display='block';";
+  html += "const fd=new FormData();fd.append('ssid',s);fd.append('pass',p);fd.append('save',sv);";
+  html += "fetch('/ota-start',{method:'POST',body:fd}).catch(()=>{});";
+  html += "}";
 
   html += "const sv=localStorage.getItem('cwmera_v')||'grid';setView(sv);render();";
   html += "</script></body></html>";
@@ -801,6 +914,35 @@ void handleDelete() {
   server.send(200, "text/plain", "OK");
 }
 
+void handleOtaInfo() {
+  Preferences p;
+  p.begin("cwmera_net", true);
+  String s = p.getString("ssid", "");
+  String pw = p.getString("pass", "");
+  p.end();
+
+  String json = "{\"version\":\"" CWMERA_VERSION "\",\"ssid\":\"" + s + "\",\"pass\":\"" + pw + "\"}";
+  server.send(200, "application/json", json);
+}
+
+void handleOtaStart() {
+  otaTargetSSID = server.arg("ssid");
+  otaTargetPass = server.arg("pass");
+  bool save = (server.arg("save") == "1");
+
+  if (save) {
+    Preferences p;
+    p.begin("cwmera_net", false);
+    p.putString("ssid", otaTargetSSID);
+    p.putString("pass", otaTargetPass);
+    p.end();
+  }
+
+  server.send(200, "application/json", "{\"status\":\"ok\"}");
+  otaRequested = true;
+  otaRequestedMillis = millis();
+}
+
 void startWiFi() {
   WiFi.mode(WIFI_AP);
   WiFi.softAP("cwmera");
@@ -813,6 +955,8 @@ void startWiFi() {
   server.on("/photo", HTTP_GET, handlePhoto);
   server.on("/download", HTTP_GET, handleDownload);
   server.on("/delete", HTTP_ANY, handleDelete);
+  server.on("/ota-info", HTTP_GET, handleOtaInfo);
+  server.on("/ota-start", HTTP_POST, handleOtaStart);
   server.onNotFound(handleRoot);
   server.begin();
 
@@ -857,6 +1001,219 @@ void showWiFiScreen() {
   tft.setTextSize(1);
   tft.setCursor(25, 205);
   tft.print("click per tornare a scattare");
+}
+
+void waitForAnyButtonClick() {
+  while (digitalRead(BTN_CAMERA_PIN) == LOW || digitalRead(BACKUP_BOOT_PIN) == LOW || digitalRead(BTN_GALLERY_PIN) == LOW) {
+    delay(10);
+  }
+  delay(50);
+  while (digitalRead(BTN_CAMERA_PIN) == HIGH && digitalRead(BACKUP_BOOT_PIN) == HIGH && digitalRead(BTN_GALLERY_PIN) == HIGH) {
+    delay(20);
+  }
+  while (digitalRead(BTN_CAMERA_PIN) == LOW || digitalRead(BACKUP_BOOT_PIN) == LOW || digitalRead(BTN_GALLERY_PIN) == LOW) {
+    delay(10);
+  }
+  delay(50);
+}
+
+void performOnlineOTA(String ssid, String pass) {
+  // 1. Schermata base con bordi squadrati coerenti con showWiFiScreen()
+  tft.fillScreen(ST77XX_WHITE);
+  tft.drawRect(10, 10, 300, 220, ST77XX_BLACK);
+  tft.drawRect(11, 11, 298, 218, ST77XX_BLACK);
+
+  tft.setTextColor(ST77XX_BLACK);
+  tft.setTextSize(2);
+  tft.setCursor(25, 25);
+  tft.print("cwmera update");
+
+  tft.setTextSize(1);
+  tft.setCursor(25, 48);
+  tft.printf("versione corrente: v%s", CWMERA_VERSION);
+
+  tft.drawFastHLine(10, 62, 300, ST77XX_BLACK);
+
+  // 2. Connessione Wi-Fi alla rete indicata
+  tft.setCursor(25, 75);
+  tft.print("1. connessione wi-fi:");
+  tft.setCursor(25, 90);
+  String dispSSID = ssid.length() > 18 ? ssid.substring(0, 15) + "..." : ssid;
+  tft.printf("> %s", dispSSID.c_str());
+
+  WiFi.disconnect(true);
+  delay(100);
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(ssid.c_str(), pass.c_str());
+
+  unsigned long startConn = millis();
+  bool connected = false;
+  int dotCount = 0;
+
+  while (millis() - startConn < 15000) {
+    if (WiFi.status() == WL_CONNECTED) {
+      connected = true;
+      break;
+    }
+    delay(400);
+    dotCount++;
+    tft.fillRect(25 + 130, 90, 45, 10, ST77XX_WHITE);
+    tft.setCursor(25 + 130, 90);
+    for (int d = 0; d < (dotCount % 4); d++) tft.print(".");
+  }
+
+  if (!connected) {
+    tft.fillRect(25 + 130, 90, 45, 10, ST77XX_WHITE);
+    tft.setCursor(220, 90);
+    tft.print("[FALLITA]");
+    tft.setCursor(25, 110);
+    tft.print("errore: password o rete errata");
+    tft.drawFastHLine(10, 195, 300, ST77XX_BLACK);
+    tft.setCursor(25, 205);
+    tft.print("click per tornare al mirino");
+    soundError();
+    waitForAnyButtonClick();
+    WiFi.disconnect(true);
+    WiFi.mode(WIFI_OFF);
+    return;
+  }
+
+  tft.fillRect(25 + 130, 90, 45, 10, ST77XX_WHITE);
+  tft.setCursor(235, 90);
+  tft.print("[ OK ]");
+
+  // 3. Controllo GitHub Releases
+  tft.setCursor(25, 115);
+  tft.print("2. verifica su github:");
+
+  WiFiClientSecure client;
+  client.setInsecure();
+  client.setTimeout(15);
+
+  HTTPClient http;
+  http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+  http.begin(client, "https://api.github.com/repos/" GITHUB_REPO "/releases/latest");
+  http.addHeader("User-Agent", "cwmera-esp32");
+
+  int httpCode = http.GET();
+  if (httpCode != HTTP_CODE_OK) {
+    tft.setCursor(25, 132);
+    if (httpCode == 404) {
+      tft.print("nessuna release su github");
+    } else {
+      tft.printf("errore github (HTTP %d)", httpCode);
+    }
+    tft.drawFastHLine(10, 195, 300, ST77XX_BLACK);
+    tft.setCursor(25, 205);
+    tft.print("click per tornare al mirino");
+    soundError();
+    waitForAnyButtonClick();
+    http.end();
+    WiFi.disconnect(true);
+    WiFi.mode(WIFI_OFF);
+    return;
+  }
+
+  String payload = http.getString();
+  http.end();
+
+  // Parsing tag_name della release
+  String latestTag = "";
+  int tagPos = payload.indexOf("\"tag_name\":");
+  if (tagPos != -1) {
+    int startQuote = payload.indexOf("\"", tagPos + 11);
+    int endQuote = payload.indexOf("\"", startQuote + 1);
+    latestTag = payload.substring(startQuote + 1, endQuote);
+  }
+
+  String cleanLatest = latestTag;
+  if (cleanLatest.startsWith("v") || cleanLatest.startsWith("V")) cleanLatest = cleanLatest.substring(1);
+  String cleanCurrent = CWMERA_VERSION;
+  if (cleanCurrent.startsWith("v") || cleanCurrent.startsWith("V")) cleanCurrent = cleanCurrent.substring(1);
+
+  if (cleanLatest.length() == 0 || cleanLatest.equalsIgnoreCase(cleanCurrent)) {
+    tft.setCursor(25, 132);
+    tft.printf("gia' aggiornato (v%s)", cleanCurrent.c_str());
+    tft.drawFastHLine(10, 195, 300, ST77XX_BLACK);
+    tft.setCursor(25, 205);
+    tft.print("click per tornare al mirino");
+    soundWiFiStart();
+    waitForAnyButtonClick();
+    WiFi.disconnect(true);
+    WiFi.mode(WIFI_OFF);
+    return;
+  }
+
+  // Nuova versione rilevata
+  tft.setCursor(25, 132);
+  tft.printf("trovata: v%s -> v%s", cleanCurrent.c_str(), cleanLatest.c_str());
+
+  // Ricerca URL asset .bin
+  String downloadUrl = "";
+  int binPos = payload.indexOf(".bin\"");
+  if (binPos != -1) {
+    int urlPos = payload.lastIndexOf("\"browser_download_url\":", binPos);
+    if (urlPos != -1) {
+      int startQuote = payload.indexOf("\"", urlPos + 23);
+      int endQuote = payload.indexOf("\"", startQuote + 1);
+      downloadUrl = payload.substring(startQuote + 1, endQuote);
+    }
+  }
+
+  if (downloadUrl.length() == 0) {
+    downloadUrl = "https://github.com/" GITHUB_REPO "/releases/download/" + latestTag + "/cwmera.bin";
+  }
+
+  // 4. Download firmware e scrittura nella partizione OTA
+  tft.setCursor(25, 153);
+  tft.print("3. download firmware:");
+
+  // Cornice progress bar
+  tft.drawRect(25, 168, 270, 14, ST77XX_BLACK);
+
+  tft.drawFastHLine(10, 195, 300, ST77XX_BLACK);
+  tft.setCursor(25, 205);
+  tft.print("non spegnere cwmera!");
+
+  httpUpdate.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+  httpUpdate.rebootOnUpdate(false);
+
+  httpUpdate.onProgress([](size_t cur, size_t total) {
+    if (total > 0) {
+      int fillW = (int)((cur * 266) / total);
+      if (fillW > 266) fillW = 266;
+      tft.fillRect(27, 170, fillW, 10, ST77XX_BLACK);
+    }
+  });
+
+  t_httpUpdate_return ret = httpUpdate.update(client, downloadUrl);
+
+  if (ret == HTTP_UPDATE_OK) {
+    tft.fillScreen(ST77XX_WHITE);
+    tft.drawRect(10, 10, 300, 220, ST77XX_BLACK);
+    tft.drawRect(11, 11, 298, 218, ST77XX_BLACK);
+    tft.setTextColor(ST77XX_BLACK);
+    tft.setTextSize(2);
+    tft.setCursor(25, 65);
+    tft.print("AGGIORNATO!");
+    tft.setTextSize(1);
+    tft.setCursor(25, 105);
+    tft.printf("cwmera v%s installata", cleanLatest.c_str());
+    tft.setCursor(25, 135);
+    tft.print("riavvio in corso...");
+    
+    soundBoot();
+    delay(1500);
+    ESP.restart();
+  } else {
+    tft.fillRect(12, 196, 296, 20, ST77XX_WHITE);
+    tft.setCursor(25, 205);
+    tft.printf("errore ota: %s", httpUpdate.getLastErrorString().c_str());
+    soundError();
+    waitForAnyButtonClick();
+    WiFi.disconnect(true);
+    WiFi.mode(WIFI_OFF);
+  }
 }
 
 void showLiveTransitionScreen() {
@@ -1236,9 +1593,13 @@ void setup() {
   for (int i = 0; i < 8; i++) pinMode(dataPins[i], INPUT_PULLDOWN);
   pinMode(VSY_PIN, INPUT);
   pinMode(WR_PIN, OUTPUT);
+  digitalWrite(WR_PIN, LOW); // Blocca immediatamente la scrittura nella FIFO
   pinMode(WRST_PIN, OUTPUT);
+  digitalWrite(WRST_PIN, HIGH);
   pinMode(RRST_PIN, OUTPUT);
+  digitalWrite(RRST_PIN, HIGH);
   pinMode(STR_PIN, OUTPUT);
+  digitalWrite(STR_PIN, HIGH);
 
   pinMode(BTN_CAMERA_PIN, INPUT_PULLUP);
   pinMode(BTN_GALLERY_PIN, INPUT_PULLUP);
@@ -1247,11 +1608,6 @@ void setup() {
   pinMode(BUZZER_PIN, OUTPUT);
   noTone(BUZZER_PIN);
   initSoundSetting();
-
-  digitalWrite(WR_PIN, LOW); 
-  digitalWrite(WRST_PIN, HIGH);
-  digitalWrite(RRST_PIN, HIGH);
-  digitalWrite(STR_PIN, HIGH);
 
   SPI.begin(TFT_SCLK, -1, TFT_MOSI, TFT_CS);
   tft.init(240, 320);
@@ -1264,9 +1620,18 @@ void setup() {
 
   // Setup I2C OV7670
   Wire.begin(SIOD_PIN, SIOC_PIN);
-  delay(100);
-  writeRegister(0x12, 0x80); // Reset HW
-  delay(100);
+  Wire.setClock(100000);
+  delay(300); // Stabilizzazione alimentazione e oscillatore 24MHz all'avvio a freddo
+
+  // Handshake I2C: attendi che il modulo OV7670 sia pronto e risponda (evita invio a vuoto all'avvio)
+  for (int i = 0; i < 20; i++) {
+    Wire.beginTransmission(0x21);
+    if (Wire.endTransmission() == 0) break;
+    delay(50);
+  }
+
+  writeRegister(0x12, 0x80); // Reset HW/SW sensore
+  delay(250); // Fondamentale: tempo per ricaricare i registri di default dopo il soft reset
   
   byte regs[][2] = {
     {0x12, 0x14}, // COM7: Formato QVGA + Output RGB (Riattiva il colore!)
@@ -1283,21 +1648,38 @@ void setup() {
     {0x73, 0xF1}, // SCALING_PCLK_DIV
     {0xA2, 0x02}, // SCALING_PCLK_DELAY
 
+    // Orientamento Hardware: Ruota l'immagine di 180° (Flip Verticale + Mirror Orizzontale)
+    {0x1E, 0x30}, // MVFP: Bit 5 (Mirror 0x20) | Bit 4 (VFlip 0x10) = 0x30
+
     // IL TRUCCO DEL RITAGLIO: Forza esattamente 320x240 (Elimina le strisce)
     {0x17, 0x16}, {0x18, 0x04}, {0x32, 0x24}, // Taglio Orizzontale
     {0x19, 0x02}, {0x1A, 0x7A}, {0x03, 0x0A}, // Taglio Verticale
 
     // Rianimazione dei Colori e del DSP
-    {0x13, 0xE5}, // COM8: Abilita Esposizione e Bilanciamento Bianco
-    {0x14, 0x38}, // COM9: Limite luminosità
+    {0x13, 0xE5}, // COM8: Abilita AGC (guadagno automatico) e AEC (esposizione automatica)
+    {0x14, 0x18}, // COM9: Limita Gain Ceiling a 4x (evita amplificazione e rumore sotto forte luce)
+    {0x3B, 0x0A}, // COM11: CRUCIALE! Sblocca l'esposizione al di sotto del limite di banding (anti-whiteout all'aperto)
+
+    // Gestione Auto-Esposizione Hardware (AEC/AGC) e Istogramma Dinamico
+    {0x24, 0x75}, // AEW: Soglia superiore regione operativa stabile AEC
+    {0x25, 0x63}, // AEB: Soglia inferiore regione operativa stabile AEC
+    {0x26, 0xA5}, // VPT: Soglie operative veloci per transizioni repentine luce/ombra
+    {0x9F, 0x78}, // HAECC1: Controllo istogramma AEC 1
+    {0xA0, 0x68}, // HAECC2: Controllo istogramma AEC 2
+    {0xA1, 0x03}, // Controllo fast mode istogramma
+
     {0x3D, 0xC0}, // COM13: Gamma Curve
     {0x4F, 0x80}, {0x50, 0x80}, {0x51, 0x00}, // Matrice Colori (Saturazione)
     {0x52, 0x22}, {0x53, 0x5E}, {0x54, 0x80},
-    {0x55, 0x00}, // BRIGHT: Luminosita' neutra (elimina il clipping sovraesposto dell'AEC)
+    {0x55, 0x00}, // BRIGHT: Luminosita' neutra (offset +/-0)
+    {0x56, 0x40}, // CONTRAS: Contrasto standard (1.0x)
     {0x42, 0x00}  // COM17: Spegne definitivamente il test pattern/monoscopio
   };
 
-  for (auto& r : regs) writeRegister(r[0], r[1]);
+  for (auto& r : regs) {
+    writeRegister(r[0], r[1]);
+    delay(2);
+  }
   Serial.println("Fotocamera Pronta!");
   
   // Schermata di avvio: sfondo bianco, cwmera nero centrato senza riquadro, sottotitolo allineato a sx del titolo
@@ -1313,6 +1695,12 @@ void setup() {
 
   soundBoot();
   delay(900);
+
+  // Purga e allineamento iniziale FIFO: esegue due frame a vuoto per stabilizzare clock e bus
+  for (int i = 0; i < 2; i++) {
+    captureFrameToFIFO();
+    resetFIFOReadPointer();
+  }
 }
 
 // ==============================================================================
@@ -1334,6 +1722,16 @@ void loop() {
   if (currentMode == MODE_WIFI) {
     dnsServer.processNextRequest();
     server.handleClient();
+
+    // Se l'utente ha richiesto l'aggiornamento OTA online dalla Web App
+    if (otaRequested && (millis() - otaRequestedMillis > 400)) {
+      otaRequested = false;
+      stopWiFi();
+      performOnlineOTA(otaTargetSSID, otaTargetPass);
+      currentMode = MODE_CAMERA;
+      showLiveTransitionScreen();
+      return;
+    }
 
     if (btnCamera || btnGallery) {
       if ((digitalRead(BTN_CAMERA_PIN) == LOW || digitalRead(BACKUP_BOOT_PIN) == LOW) && digitalRead(BTN_GALLERY_PIN) == LOW) {
@@ -1461,15 +1859,8 @@ void loop() {
   }
 
   // === ACQUISIZIONE E STREAMING LIVE AL DISPLAY ===
-  while(digitalRead(VSY_PIN) == LOW);  
-  digitalWrite(WRST_PIN, LOW); delayMicroseconds(5); digitalWrite(WRST_PIN, HIGH);
-  while(digitalRead(VSY_PIN) == HIGH); digitalWrite(WR_PIN, HIGH);          
-  while(digitalRead(VSY_PIN) == LOW);  digitalWrite(WR_PIN, LOW);           
-
-  digitalWrite(RRST_PIN, LOW); delayMicroseconds(5);
-  digitalWrite(STR_PIN, LOW); delayMicroseconds(2);
-  digitalWrite(STR_PIN, HIGH); delayMicroseconds(2);
-  digitalWrite(RRST_PIN, HIGH); delayMicroseconds(5);
+  captureFrameToFIFO();
+  resetFIFOReadPointer();
 
   tft.startWrite();
   tft.setAddrWindow(0, 0, 320, 240);

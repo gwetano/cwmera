@@ -117,4 +117,20 @@
      * Memoria libera disponibile e stima delle foto rimanenti.
      * Icona di download diretto per salvare le foto nel rullino.
      * Icona cestino per eliminare le foto dall'ESP32.
+     * Icona di aggiornamento firmware in alto per verificare le nuove versioni su GitHub.
 3. Premi 1 volta uno dei pulsanti fisici sulla fotocamera per spegnere il Wi-Fi e tornare istantaneamente al mirino live!
+
+---
+
+### Aggiornamento Firmware Online (OTA via GitHub Releases)
+`cwmera` supporta l'aggiornamento del firmware via Wi-Fi direttamente dai rilasci ufficiali di GitHub senza bisogno di cavi USB:
+1. Connettiti alla rete **`cwmera`** e apri la pagina web (`http://192.168.4.1/`).
+2. Clicca sull'**icona di aggiornamento** nella barra superiore accanto al selettore matrice/elenco.
+3. Inserisci il nome (SSID) e la password del tuo Wi-Fi di casa (puoi spuntare *"memorizza questa rete"* per non ridigitarla in futuro) e premi **`verifica`**.
+4. Guarda il **display ST7789** della fotocamera:
+   * Si connetterà al Wi-Fi.
+   * Verificherà se è presente una nuova release su GitHub.
+   * Se presente, scaricherà il nuovo firmware mostrando la barra di avanzamento e si riavvierà automaticamente.
+
+> [!NOTE]
+> **Requisito Schema Partizioni**: in Arduino IDE seleziona uno schema che supporti l'OTA (ad esempio `8MB with spiffs (3MB APP/1.5MB SPIFFS)`).
