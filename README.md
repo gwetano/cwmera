@@ -1,7 +1,7 @@
 # cwmera
 
 <p align="center">
-  <img src="./images/ex.jpg" alt="cwmera showcase" width="100%">
+  <img src="./images/ex.jpg" alt="cwmera showcase" width="55%">
 </p>
 
 <p align="center">
@@ -11,8 +11,6 @@
   <a href="https://www.espressif.com/en/products/socs/esp32-s3">
     <img src="https://img.shields.io/badge/Hardware-ESP32--S3-black?style=for-the-badge&logo=espressif" alt="ESP32-S3">
   </a>
-  <img src="https://img.shields.io/badge/Sensor-OV7670%20FIFO-black?style=for-the-badge" alt="OV7670 FIFO">
-  <img src="https://img.shields.io/badge/Display-ST7789%20IPS-black?style=for-the-badge" alt="ST7789 IPS">
   <a href="./LICENSE">
     <img src="https://img.shields.io/badge/License-MIT-black?style=for-the-badge" alt="License: MIT">
   </a>
@@ -25,7 +23,7 @@
 
 ---
 
-## ✨ Features
+## Features
 
 * **Instant-On Shooting**: Zero boot delay. Starts up in under a second with no Wi-Fi blocking.
 * **Hardware FIFO Capture**: Direct fast GPIO register reads from the AL422B FIFO chip, ensuring clean, frame-accurate QVGA (320x240) captures without tearing.
@@ -38,12 +36,12 @@
 
 ---
 
-## 🧰 Hardware Components
+## Hardware Components
 
 | Component | Specification / Notes |
 | :--- | :--- |
 | **Microcontroller** | **ESP32-S3** (Dual-Core Xtensa LX7 @ 240 MHz, 8MB PSRAM, 8MB/16MB Flash) |
-| **Camera Sensor** | **OmniVision OV7670 with FIFO (AL422B)**<br>• Output: QVGA (320x240) RGB565 / Grayscale<br>• SCCB / I2C Address: `0x21`<br>• Dedicated 384 KB buffer memory to prevent frame drops |
+| **Camera Sensor** | **OV7670 with FIFO (AL422B)**<br>• Output: QVGA (320x240) RGB565 / Grayscale<br>• SCCB / I2C Address: `0x21`<br>• Dedicated 384 KB buffer memory to prevent frame drops |
 | **Display** | **ST7789 IPS LCD** (240x320 pixels, Full Color, Hardware SPI @ 40 MHz) |
 | **Controls** | 2x Tactile Push Buttons (Top Shutter button + Rear Gallery button) |
 | **Audio** | Passive Piezoelectric Buzzer for acoustic UI feedback |
@@ -51,7 +49,7 @@
 
 ---
 
-## 🔌 Pinout & Wiring
+## Pinout & Wiring
 
 ### 1. ST7789 IPS Display -> ESP32-S3
 | Display Pin | Description | ESP32-S3 Pin |
@@ -101,35 +99,35 @@
 
 ---
 
-## 🕹️ Controls & Gestures
+## Controls & Gestures
 
-### 📷 Shutter Button (Top)
+### Shutter Button (Top)
 * **In Live Viewfinder:**
   * **Single Click:** Instantly captures a photo and writes it to flash memory (`/DCIM/FOTO_xxxx.jpg`).
   * **Long Press (> 450 ms):** Shows circular transmission progress ring (`0% -> 100%`). Releasing after 100% starts **`cwmera wifi`** mode.
 * **In Gallery Mode:**
   * **Any Click:** Exits gallery and returns immediately to the live camera preview.
 
-### 🖼️ Gallery Button (Rear, next to screen)
+### Gallery Button (Rear, next to screen)
 * **In Live Viewfinder:**
   * **Any Click:** Opens the on-device photo gallery showing the most recent capture.
 * **In Gallery Mode:**
   * **Single Click:** Cycles to the previous photo.
   * **Long Press (> 450 ms):** Shows circular deletion countdown ring (`0% -> 100%`). Releasing at 100% deletes the current photo from flash.
 
-### 🔇 Mute / Unmute (Both Buttons Together)
+### Mute / Unmute (Both Buttons Together)
 * **Press Both Buttons Simultaneously:** Toggles all audio feedback on/off.
 * The state is stored permanently in Non-Volatile Storage (NVS) across reboots.
 
-### 🌐 In Wi-Fi Mode
+### In Wi-Fi Mode
 * **Press Any Physical Button:** Immediately shuts down the Wi-Fi server and returns to live shooting mode.
 
 ---
 
-## 📲 Wireless Photo Transfer (iOS & Android)
+## Wireless Photo Transfer (iOS & Android)
 
 <p align="center">
-  <img src="./images/IMG_4010.jpg" alt="cwmera web interface" width="85%">
+  <img src="./images/IMG_4010.jpg" alt="cwmera web interface" width="35%">
 </p>
 
 1. In the camera viewfinder, **hold the top button** until the progress circle fills to 100% to enter `cwmera wifi` mode.
@@ -146,7 +144,7 @@
 
 ---
 
-## 🔄 Online Firmware Updates (OTA via GitHub Releases)
+## Online Firmware Updates (OTA via GitHub Releases)
 
 `cwmera` features an integrated wireless update flow without needing a USB cable:
 
@@ -161,7 +159,7 @@
 
 ---
 
-## ⚙️ Arduino IDE Setup & Partition Scheme
+## Arduino IDE Setup & Partition Scheme
 
 1. In the Arduino Boards Manager, install **`esp32` by Espressif Systems**.
 2. Select your board: **`ESP32S3 Dev Module`**.
@@ -175,16 +173,15 @@
 
 ---
 
-## 📦 3D Printable Enclosure
+## 3D Printable Enclosure
 
 The CAD files and 3D printable models (`.stl` / `.step`) are located in the [`3d_models/`](./3d_models) directory.
 * **Recommended Material:** Matte Black / White PLA or PETG.
-* **Layer Height:** `0.16mm` or `0.20mm`.
-* **Hardware:** M2 / M2.5 screws for panel mounting.
+* **Layer Height:** `0.20mm` or `0.24mm`.
 
 ---
 
-## 🗺️ Project Status & What's Missing
+## Project Status & What's Missing
 
 `cwmera` is fully operational as a functional point-and-shoot camera. Here is what is planned to make it a complete open-source maker product:
 
@@ -201,7 +198,7 @@ The CAD files and 3D printable models (`.stl` / `.step`) are located in the [`3d
 
 ---
 
-## 📄 License
+##  License
 
 This project is licensed under the **MIT License** — see the [LICENSE](./LICENSE) file for details.
 Designed and built by [Gaetano Carbone (@gwetano)](https://github.com/gwetano).
